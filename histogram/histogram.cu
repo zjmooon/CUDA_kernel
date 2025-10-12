@@ -1,6 +1,5 @@
 #include "../common.h"
 #include <cuda_runtime.h>
-#include <stdio.h>
 #include <random>
 #include <iostream>
 #include <opencv2/opencv.hpp>
@@ -11,12 +10,12 @@
 输入： unsigned char* 3840*2160*1（WHC, 16bits 0~65536）
 输出： int* hist[BINNUM] 
 */
-const int WIDTH = 3840;
-const int HEIGHT = 2160;
-const int INPUTNUM = WIDTH * HEIGHT;
-const int BINNUM = 256;
-const int BLOCK_X = 32;
-const int BLOCK_Y = 8;
+constexpr int WIDTH = 3840;
+constexpr int HEIGHT = 2160;
+constexpr int INPUTNUM = WIDTH * HEIGHT;
+constexpr int BINNUM = 256;
+constexpr int BLOCK_X = 32;
+constexpr int BLOCK_Y = 8;
 
 void simulateGray(unsigned char* data, int num) {
     std::random_device rd;
@@ -190,15 +189,11 @@ int main(int argc, char** argv)
     }
 
     double start, elaps;
-    cudaEvent_t k_start, k_stop;
-    float elapsed_ms = 0.0f;
-    CHECK(cudaEventCreate(&k_start));
-    CHECK(cudaEventCreate(&k_stop));
 
     // run a warmup kernel to remove overhead
-    CHECK(cudaDeviceSynchronize());
+    CHECK(cudaStreamSynchronize(0));
     warmingup<<<grid, block>>>(d_input);
-    CHECK(cudaDeviceSynchronize());
+    CHECK(cudaStreamSynchronize(0));
 
 
     switch (kernelFun)
@@ -210,16 +205,9 @@ int main(int argc, char** argv)
         std::cout << "Host elapsed " << elaps * 1000 << "ms" << std::endl;
         break;
     case 1:
-        CHECK(cudaDeviceSynchronize());
-        CHECK(cudaEventRecord(k_start, 0));
         gpuHistogramNaive<<<grid, block>>>(d_input, d_histo, WIDTH, HEIGHT);
-        CHECK(cudaEventRecord(k_stop, 0));
-        CHECK(cudaDeviceSynchronize());
-        CHECK(cudaEventSynchronize(k_stop));
+        CHECK(cudaStreamSynchronize(0));
         
-        CHECK(cudaEventElapsedTime(&elapsed_ms, k_start, k_stop));
-        std::cout << "gpuHistogramNaive execution elapsed: " << elapsed_ms << " ms" << std::endl;
-
         CHECK(cudaMemcpy(h_histo, d_histo, BINNUM * sizeof(unsigned int), cudaMemcpyDeviceToHost));
         for (int i=0; i<BINNUM; ++i) {
             std::cout << "gray" << i << ":" << h_histo[i] << " ";
@@ -227,16 +215,9 @@ int main(int argc, char** argv)
         std::cout << std::endl; 
         break;
     case 2:
-        CHECK(cudaDeviceSynchronize());
-        CHECK(cudaEventRecord(k_start, 0));
         gpuHistogramSMem<<<grid, block>>>(d_input, d_histo, WIDTH, HEIGHT);
-        CHECK(cudaEventRecord(k_stop, 0));
-        CHECK(cudaDeviceSynchronize());
-        CHECK(cudaEventSynchronize(k_stop));
+        CHECK(cudaStreamSynchronize(0));
         
-        CHECK(cudaEventElapsedTime(&elapsed_ms, k_start, k_stop));
-        std::cout << "gpuHistogramSMem execution elapsed: " << elapsed_ms << " ms" << std::endl;
-
         CHECK(cudaMemcpy(h_histo, d_histo, BINNUM * sizeof(unsigned int), cudaMemcpyDeviceToHost));
         for (int i=0; i<BINNUM; ++i) {
             std::cout << "gray" << i << ":" << h_histo[i] << " ";
@@ -247,15 +228,9 @@ int main(int argc, char** argv)
         block = dim3(BLOCK_X, BLOCK_Y);
         grid  = dim3(CEIL(CEIL(WIDTH, 4), BLOCK_X), CEIL(HEIGHT, BLOCK_Y));
 
-        CHECK(cudaDeviceSynchronize());
-        CHECK(cudaEventRecord(k_start, 0));
         gpuHistogramVectorization<<<grid, block>>>(d_uchar4_input, d_histo, WIDTH, HEIGHT);
-        CHECK(cudaEventRecord(k_stop, 0));
-        CHECK(cudaDeviceSynchronize());
-        CHECK(cudaEventSynchronize(k_stop));
+        CHECK(cudaStreamSynchronize(0));
 
-        CHECK(cudaEventElapsedTime(&elapsed_ms, k_start, k_stop));
-        std::cout << "gpuHistogramVectorization execution elapsed: " << elapsed_ms << " ms" << std::endl;
 
         CHECK(cudaMemcpy(h_histo, d_histo, BINNUM * sizeof(unsigned int), cudaMemcpyDeviceToHost));
         for (int i=0; i<BINNUM; ++i) {
@@ -272,8 +247,6 @@ int main(int argc, char** argv)
     delete[] h_histo;
     CHECK(cudaFree(d_histo));
     CHECK(cudaFree(d_input));
-    CHECK(cudaEventDestroy(k_start));
-    CHECK(cudaEventDestroy(k_stop));
 
     return 0;
 } 
