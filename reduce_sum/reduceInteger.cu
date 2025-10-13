@@ -69,7 +69,6 @@ __global__ void kReduceNeighbored(int *src, int *dst, unsigned int N)
     // 再做一次归约将每个块的值相加获得总的和
     if (tid == 0) atomicAdd(dst, idata[0]);
 }
-
 void iReduceNeighbored(int *src, int *dst, unsigned int n, int *sum) {
     dim3 blockSize(256, 1);
     dim3 gridSize(CEIL(n, blockSize.x), 1);
@@ -123,14 +122,59 @@ __global__ void kReduceInterleaved(int *src, int *dst, unsigned int N)
     // 每个block第一个线程，做一次归约将每个块的值相加获得总的和
     if (tid == 0) atomicAdd(dst, idata[0]);
 }
-
 void iReduceInterleaved(int *src, int *dst, unsigned int n, int *sum) {
-    dim3 blockSize(256, 1);
-    dim3 gridSize(CEIL(n, blockSize.x), 1);
+    dim3 blockSize(256);
+    dim3 gridSize(CEIL(n, blockSize.x));
     
     cudaMemset(dst, 0, sizeof(int));
 
     kReduceInterleaved<256><<<gridSize, blockSize>>>(src, dst, n);
+    CHECK(cudaDeviceSynchronize());
+
+    *sum = 0;
+    cudaMemcpy(sum, dst, sizeof(int), cudaMemcpyDeviceToHost);
+
+    std::cout << *sum << ", ";
+} 
+
+
+
+// warp reduce 
+__global__ void kReduceWarp(const int *src, int *dst, int N) {
+    __shared__ int s_data[32]; // 最多32， 因为一个block最多1024线程，最多1024/32=32warp
+
+    int g_idx = threadIdx.x + blockDim.x * blockIdx.x;
+    int warpId = threadIdx.x / warpSize; // 当前线程在其block中属于第几个warp
+    int laneId = threadIdx.x % warpSize; // 当前线程在其warp中属于第几个thread
+
+    int val = (g_idx < N) ? src[g_idx] : 0; // 将数据从全局内存搬运到寄存器内存
+
+    #pragma unroll
+    for (int stride = warpSize / 2; stride > 0; stride >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, stride); // 将一个warp内的值归约到一个thread(laneId==0)中
+    }
+
+    if (laneId == 0) s_data[warpId] = val; // 将数据搬运到共享内存以便后续block内归约
+    __syncthreads();
+
+    if (warpId == 0) { // 在一个block内归约之前warp归约的结果
+        int warpNum = blockDim.x / warpSize; 
+        val = (laneId < warpNum) ? s_data[laneId] : 0; // 因为s_data可能没有全部用到，所以需要判断
+
+        #pragma unroll
+        for (int stride = warpSize / 2; stride > 0; stride >>= 1) {
+            val += __shfl_down_sync(0xffffffff, val, stride);
+        }
+        if (laneId == 0) atomicAdd(dst, val); // 一个block选择一个线程做atomicAdd，将全部block的值加到dst
+    }
+}
+void iReduceWarp(int *src, int *dst, unsigned int n, int *sum) {
+    dim3 blockSize(256);
+    dim3 gridSize(CEIL(n, blockSize.x));
+    
+    cudaMemset(dst, 0, sizeof(int));
+
+    kReduceWarp<<<gridSize, blockSize>>>(src, dst, n);
     CHECK(cudaDeviceSynchronize());
 
     *sum = 0;
@@ -165,7 +209,6 @@ __global__ void kReduceInterleaved_v2(int *src, int *dst, unsigned int N)
     // 每个block第一个线程，做一次归约将每个块的值相加获得总的和
     if (tid == 0) atomicAdd(dst, s_data[0]);
 }
-
 void iReduceInterleaved_shared(int *src, int *dst, unsigned int n, int *sum) {
     dim3 blockSize(256, 1);
     dim3 gridSize(CEIL(n, blockSize.x), 1);
@@ -200,6 +243,7 @@ __global__ void kReduceInterleavedUnrolling4(int *src, int *dst, unsigned int N)
     // 通过 idx + blockDim.x * 4 进行元素配对，减少了原始归约过程中的数据访问次数，使得每个线程处理4个元素。
     // 这有助于减少归约的总轮数，提高性能。
     // 因为归约的第一个阶段通过对邻近的两个元素进行加法操作，减少了元素总数，这样后续的归约迭代次数也会少一些。
+    
     /* int sum = 0;
     if (idx + blockDim.x * 3 < N){
         sum = src[idx] + src[idx + blockDim.x] + src[idx + blockDim.x * 2] + src[idx + blockDim.x * 3];
@@ -227,17 +271,15 @@ __global__ void kReduceInterleavedUnrolling4(int *src, int *dst, unsigned int N)
     // stride 每轮减半，最后将块内所有值归约（加）到tid==0线程上。
     // idata[tid] += idata[tid + stride]会将一对数据进行加法并存回 idata。
     
-    // if (tid == 0) g_odata[blockIdx.x] = idata[0];
     if (tid == 0) atomicAdd(dst, s_data[0]);
 }
-
 void iReduceInterleavedUnrolling4(int *src, int *dst, unsigned int n, int *sum) {
     dim3 blockSize(256);
-    dim3 gridSize(CEIL(n, blockSize.x));
+    dim3 gridSize(CEIL(CEIL(n, blockSize.x), 4)); // 在grid维度取 1/4
     
     cudaMemset(dst, 0, sizeof(int));
 
-    kReduceInterleavedUnrolling4<256><<<gridSize, blockSize>>>(src, dst, n);
+    kReduceInterleavedUnrolling4<256><<<(gridSize), blockSize>>>(src, dst, n);
     CHECK(cudaDeviceSynchronize());
 
     *sum = 0;
@@ -248,26 +290,20 @@ void iReduceInterleavedUnrolling4(int *src, int *dst, unsigned int n, int *sum) 
 
 
 
-__global__ void reduceUnrolling8(int *g_idata, int *g_odata, unsigned int n)
+__global__ void kReduceInterleavedUnrolling8(int *src, int *dst, unsigned int N)
 {
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x * 8 + threadIdx.x;
     // idx是当前线程要操作的第一个数据的全局索引，以blockDim.x为步长
-    int *idata = g_idata + blockIdx.x * blockDim.x * 8;
+    int *idata = src + blockIdx.x * blockDim.x * 8;
     // idata是局部地址，是g_idata的某些偏移。blockIdx.x * blockDim.x * 8是线程层面转成数据层面（*8：每个线程处理8个数据）
 
-    if (idx + blockDim.x * 7 < n) {
+    if (idx + blockDim.x * 7 < N) {
         // 全局指针g_idata 配全局索引idx
-        int a1 = g_idata[idx];
-        int a2 = g_idata[idx + blockDim.x * 1];
-        int a3 = g_idata[idx + blockDim.x * 2];
-        int a4 = g_idata[idx + blockDim.x * 3];
-        int a5 = g_idata[idx + blockDim.x * 4];
-        int a6 = g_idata[idx + blockDim.x * 5];
-        int a7 = g_idata[idx + blockDim.x * 6];
-        int a8 = g_idata[idx + blockDim.x * 7];
-        g_idata[idx] = a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8; 
+        src[idx] = src[idx] + src[idx + blockDim.x * 1] + src[idx + blockDim.x * 2] + src[idx + blockDim.x * 3] + 
+                   src[idx + blockDim.x * 4] + src[idx + blockDim.x * 5] + src[idx + blockDim.x * 6] + src[idx + blockDim.x * 7]; 
     }
+    __syncthreads(); // 需要放置栅栏
 
     for (int stride =  blockDim.x / 2; stride  > 0; stride >>= 1) {
         if (tid < stride) {
@@ -275,8 +311,62 @@ __global__ void reduceUnrolling8(int *g_idata, int *g_odata, unsigned int n)
         }
         __syncthreads();
     }
-    if (tid == 0) g_odata[blockIdx.x] = idata[0];
+
+    if (tid == 0) atomicAdd(dst, idata[0]);
 }
+__global__ void kReduceInterleavedUnrolling8_origin(int *src, int *dst, unsigned int N)
+{
+    // set thread ID
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x * 8 + threadIdx.x;
+
+    // convert global data pointer to the local pointer of this block
+    int *idata = src + blockIdx.x * blockDim.x * 8;
+
+    // unrolling 8
+    if (idx + 7 * blockDim.x < N)
+    {
+        int a1 = src[idx];
+        int a2 = src[idx + blockDim.x];
+        int a3 = src[idx + 2 * blockDim.x];
+        int a4 = src[idx + 3 * blockDim.x];
+        int b1 = src[idx + 4 * blockDim.x];
+        int b2 = src[idx + 5 * blockDim.x];
+        int b3 = src[idx + 6 * blockDim.x];
+        int b4 = src[idx + 7 * blockDim.x];
+        src[idx] = a1 + a2 + a3 + a4 + b1 + b2 + b3 + b4;
+    }
+
+    __syncthreads();
+
+    // in-place reduction in global memory
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            idata[tid] += idata[tid + stride];
+        }
+
+        // synchronize within threadblock
+        __syncthreads();
+    }
+
+    if (tid == 0) atomicAdd(dst, idata[0]);
+}
+void iReduceInterleavedUnrolling8(int *src, int *dst, unsigned int n, int *sum) {
+    dim3 blockSize(256);
+    dim3 gridSize(CEIL(CEIL(n, blockSize.x), 8)); // 在grid维度取 1/8
+    
+    cudaMemset(dst, 0, sizeof(int));
+
+    kReduceInterleavedUnrolling8<<<gridSize, blockSize>>>(src, dst, n);
+    CHECK(cudaDeviceSynchronize());
+
+    *sum = 0;
+    cudaMemcpy(sum, dst, sizeof(int), cudaMemcpyDeviceToHost);
+
+    std::cout << *sum << ", ";
+} 
 
 __global__ void reduceUnrolling8_unrollPragma(int *g_idata, int *g_odata, unsigned int n)
 {
@@ -312,27 +402,20 @@ __global__ void reduceUnrolling8_unrollPragma(int *g_idata, int *g_odata, unsign
     }
 }
 
-__global__ void reduceUnrollWarps8(int *g_idata, int *g_odata, unsigned int n)
+__global__ void reduceUnrollWarps8(int *src, int *dst, unsigned int N)
 {
     // set thread ID
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x * 8 + threadIdx.x;
 
     // convert global data pointer to the local pointer of this block
-    int *idata = g_idata + blockIdx.x * blockDim.x * 8;
+    int *idata = src + blockIdx.x * blockDim.x * 8;
 
     // unrolling 8
-    if (idx + 7 * blockDim.x < n)
+    if (idx + 7 * blockDim.x < N)
     {
-        int a1 = g_idata[idx];
-        int a2 = g_idata[idx + blockDim.x];
-        int a3 = g_idata[idx + 2 * blockDim.x];
-        int a4 = g_idata[idx + 3 * blockDim.x];
-        int b1 = g_idata[idx + 4 * blockDim.x];
-        int b2 = g_idata[idx + 5 * blockDim.x];
-        int b3 = g_idata[idx + 6 * blockDim.x];
-        int b4 = g_idata[idx + 7 * blockDim.x];
-        g_idata[idx] = a1 + a2 + a3 + a4 + b1 + b2 + b3 + b4;
+        src[idx] = src[idx] + src[idx + blockDim.x * 1] + src[idx + blockDim.x * 2] + src[idx + blockDim.x * 3] + 
+                   src[idx + blockDim.x * 4] + src[idx + blockDim.x * 5] + src[idx + blockDim.x * 6] + src[idx + blockDim.x * 7]; 
     }
 
     __syncthreads();
@@ -345,52 +428,57 @@ __global__ void reduceUnrollWarps8(int *g_idata, int *g_odata, unsigned int n)
         {
             idata[tid] += idata[tid + stride];
         }
-
         // synchronize within threadblock
         __syncthreads();
     }
 
-    if (false) {
-        // unrolling warp
-        // warp 内的规约（reduction），也叫 warp unrolling reduction，其目的是：
-        // 把一个 warp（最多 32 个线程）中共享内存 idata[tid] 中的值，规约成一个总和，最后存入 idata[0]。
-        if (tid < 32) {
-            volatile int *vmem = idata;
-            vmem[tid] += vmem[tid + 32];
-            vmem[tid] += vmem[tid + 16];
-            vmem[tid] += vmem[tid +  8];
-            vmem[tid] += vmem[tid +  4];
-            vmem[tid] += vmem[tid +  2];
-            vmem[tid] += vmem[tid +  1];
+    /* // unrolling warp
+    // warp 内的规约（reduction），也叫 warp unrolling reduction，其目的是：
+    // 把一个 warp（最多 32 个线程）中共享内存 idata[tid] 中的值，规约成一个总和，最后存入 idata[0]。
+    if (tid < 32) {
+        volatile int *vmem = idata;
+        vmem[tid] += vmem[tid + 32];
+        vmem[tid] += vmem[tid + 16];
+        vmem[tid] += vmem[tid +  8];
+        vmem[tid] += vmem[tid +  4];
+        vmem[tid] += vmem[tid +  2];
+        vmem[tid] += vmem[tid +  1];
 
-            // write result for this block to global mem
-            if (tid == 0) g_odata[blockIdx.x] = idata[0];
-        }
-    }
+        if (tid == 0) atomicAdd(dst, idata[0]);
+    } */
 
-    if (true) {
-        // 允许 warp 内线程之间 直接交换寄存器数据；
-        // 避免使用共享内存、无需同步；
-        // mask 为活跃线程掩码，0xffffffff 表示所有 32 个线程都有效。
-        // warp-level reduction using shuffle
-        if (tid < 32)
+    // 允许 warp 内线程之间 直接交换寄存器数据；
+    // 避免使用共享内存、无需同步；
+    // mask 为活跃线程掩码，0xffffffff 表示所有 32 个线程都有效。
+    // warp-level reduction using shuffle
+    if (tid < 32)
+    {
+        int val = idata[tid];
+        // full mask: 0xffffffff
+        #pragma unroll
+        for (int stride = warpSize / 2; stride > 0; stride >>= 1)
         {
-            int val = idata[tid];
-
-            // full mask: 0xffffffff
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1)
-            {
-                val += __shfl_down_sync(0xffffffff, val, offset);
-            }
-
-            // write final result from lane 0
-            if (tid == 0) g_odata[blockIdx.x] = val;
+            val += __shfl_down_sync(0xffffffff, val, stride);
         }
-    }
 
+        if (tid == 0) atomicAdd(dst, val);
+    }
 
 }
+void iReduceUnrollWarps8(int *src, int *dst, unsigned int n, int *sum) {
+    dim3 blockSize(256);
+    dim3 gridSize(CEIL(CEIL(n, blockSize.x), 8)); // 在grid维度取 1/8
+    
+    cudaMemset(dst, 0, sizeof(int));
+
+    reduceUnrollWarps8<<<gridSize, blockSize>>>(src, dst, n);
+    CHECK(cudaDeviceSynchronize());
+
+    *sum = 0;
+    cudaMemcpy(sum, dst, sizeof(int), cudaMemcpyDeviceToHost);
+
+    std::cout << *sum << ", ";
+} 
 
 __global__ void reduceCompleteUnrollWarps8(int *g_idata, int *g_odata,
         unsigned int n)
@@ -511,77 +599,6 @@ __global__ void reduceCompleteUnroll(int *g_idata, int *g_odata,
     if (tid == 0) g_odata[blockIdx.x] = idata[0];
 }
 
-__global__ void reduceUnrollWarps(int *g_idata, int *g_odata, unsigned int n)
-{
-    // set thread ID
-    unsigned int tid = threadIdx.x;
-    unsigned int idx = blockIdx.x * blockDim.x * 2 + threadIdx.x;
-
-    // convert global data pointer to the local pointer of this block
-    int *idata = g_idata + blockIdx.x * blockDim.x * 2;
-
-    // unrolling 2
-    if (idx + blockDim.x < n) g_idata[idx] += g_idata[idx + blockDim.x];
-
-    __syncthreads();
-
-    // in-place reduction in global memory
-    for (int stride = blockDim.x / 2; stride > 32; stride >>= 1)
-    {
-        if (tid < stride)
-        {
-            idata[tid] += idata[tid + stride];
-        }
-
-        // synchronize within threadblock
-        __syncthreads();
-    }
-
-    // unrolling last warp
-    if (tid < 32)
-    {
-        volatile int *vsmem = idata;
-        vsmem[tid] += vsmem[tid + 32];
-        vsmem[tid] += vsmem[tid + 16];
-        vsmem[tid] += vsmem[tid +  8];
-        vsmem[tid] += vsmem[tid +  4];
-        vsmem[tid] += vsmem[tid +  2];
-        vsmem[tid] += vsmem[tid +  1];
-    }
-
-    if (tid == 0) g_odata[blockIdx.x] = idata[0];
-}
-
-// warp reduce 
-__global__ void reduceWarp(const int *src, int *dst, int N) {
-    __shared__ int s_data[32];
-
-    int g_idx = threadIdx.x + blockDim.x *blockIdx.x;
-    int warpId = threadIdx.x / warpSize;
-    int laneId = threadIdx.x % warpSize;
-
-    int val = (g_idx < N) ? src[g_idx] : 0;
-
-    #pragma unroll
-    for (int offset = warpSize >> 1; offset > 0; offset >>= 1) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
-    }
-
-    if (laneId == 0) s_data[warpId] = val;
-    __syncthreads();
-
-    if (warpId == 0) {
-        int warpNum = blockDim.x / warpSize;
-        val = (laneId < warpNum) ? s_data[laneId] : 0;
-
-        #pragma unroll
-        for (int offset = warpSize >> 1; offset > 0; offset >>= 1) {
-            val += __shfl_down_sync(0xffffffff, val, offset);
-        }
-        if (laneId == 0) atomicAdd(dst, val);
-    }
-}
-
 int main(int argc, char **argv)
 {
     int repeat_times = 10;
@@ -618,22 +635,37 @@ int main(int argc, char **argv)
     // gpu neighbored
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceNeighbored(d_src, d_dst, size, sum);}));
-    std::cout << std::endl << "[device neighbored]: elapsed = " << total_time / repeat_times << " ms " << std::endl;
+    std::cout << std::endl << "[device neighbored]: elapsed = " << total_time / repeat_times << " ms " << std::endl << std::endl;
 
     // gpu Interleaved
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceInterleaved(d_src, d_dst, size, sum);}));
-    std::cout << std::endl << "[device interleaved]: elapsed = " << total_time / repeat_times << " ms" << std::endl; 
+    std::cout << std::endl << "[device interleaved]: elapsed = " << total_time / repeat_times << " ms" << std::endl << std::endl; 
+
+    // gpu warp
+    cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
+    total_time = TIME_RECORD(repeat_times, ([&]{iReduceWarp(d_src, d_dst, size, sum);}));
+    std::cout << std::endl << "[device warp]: elapsed = " << total_time / repeat_times << " ms" << std::endl << std::endl; 
 
     // gpu Interleaved_shared
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceInterleaved_shared(d_src, d_dst, size, sum);}));
-    std::cout << std::endl << "[device Interleaved_shared]: elapsed = " << total_time / repeat_times << " ms" << std::endl; 
+    std::cout << std::endl << "[device Interleaved_shared]: elapsed = " << total_time / repeat_times << " ms" << std::endl << std::endl; 
 
     // gpu Interleaved_shared_unrolling4
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceInterleavedUnrolling4(d_src, d_dst, size, sum);}));
-    std::cout << std::endl << "[device Interleaved_shared_unrolling4]: elapsed = " << total_time / repeat_times << " ms" << std::endl; 
+    std::cout << std::endl << "[device Interleaved_shared_unrolling4]: elapsed = " << total_time / repeat_times << " ms" << std::endl << std::endl; 
+
+    // gpu Interleaved_unrolling8
+    cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
+    total_time = TIME_RECORD(repeat_times, ([&]{iReduceInterleavedUnrolling8(d_src, d_dst, size, sum);}));
+    std::cout << std::endl << "[device Interleaved_unrolling8]: elapsed = " << total_time / repeat_times << " ms" << std::endl << std::endl; 
+
+    // gpu Interleaved_unrolling8
+    cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
+    total_time = TIME_RECORD(repeat_times, ([&]{iReduceUnrollWarps8(d_src, d_dst, size, sum);}));
+    std::cout << std::endl << "[device Unroll8_warp]: elapsed = " << total_time / repeat_times << " ms" << std::endl << std::endl; 
 
     free(h_src);
     free(cpu_src);
