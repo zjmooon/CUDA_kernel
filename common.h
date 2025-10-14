@@ -48,4 +48,9 @@ inline double seconds()
     return ((double)tp.tv_sec + (double)tp.tv_usec * 1.e-6);
 }
 
+#define RESET       "\033[0m"
+#define RED         "\033[31m"
+#define GREEN       "\033[32m"
+#define YELLOW      "\033[33m"
+
 #endif // _COMMON_H
