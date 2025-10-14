@@ -147,7 +147,7 @@ __global__ void kReduceWarp(const int *src, int *dst, int N) {
     int warpId = threadIdx.x / warpSize; // 当前线程在其block中属于第几个warp
     int laneId = threadIdx.x % warpSize; // 当前线程在其warp中属于第几个thread
 
-    int val = (g_idx < N) ? src[g_idx] : 0; // 将数据从全局内存搬运到寄存器内存
+    int val = (g_idx < N) ? src[g_idx] : 0; // 将数据从全局内存搬运到寄存器内存, 三目运算符可有nvcc编译为selp指令（性能高于if）
 
     #pragma unroll
     for (int stride = warpSize / 2; stride > 0; stride >>= 1) {
@@ -175,6 +175,59 @@ void iReduceWarp(int *src, int *dst, unsigned int n, int *sum) {
     cudaMemset(dst, 0, sizeof(int));
 
     kReduceWarp<<<gridSize, blockSize>>>(src, dst, n);
+    CHECK(cudaDeviceSynchronize());
+
+    *sum = 0;
+    cudaMemcpy(sum, dst, sizeof(int), cudaMemcpyDeviceToHost);
+
+    std::cout << *sum << ", ";
+} 
+
+
+// warp reduce 
+__global__ void kReduceWarpVec4(const int4 *src, int *dst, int N4) {
+    __shared__ int s_data[32]; // 最多32， 因为一个block最多1024线程，最多1024/32=32warp
+
+    int g_idx = threadIdx.x + blockDim.x * blockIdx.x;
+    if (g_idx >= N4) return;
+    int warpId = threadIdx.x / warpSize; // 当前线程在其block中属于第几个warp
+    int laneId = threadIdx.x % warpSize; // 当前线程在其warp中属于第几个thread
+
+    // int val = (g_idx < N4) ? src[g_idx] : 0; // 将数据从全局内存搬运到寄存器内存
+    int val = 0;
+    int4 tmp = src[g_idx];
+    val += tmp.x;
+    val += tmp.y;
+    val += tmp.z;
+    val += tmp.w;
+    
+    #pragma unroll
+    for (int stride = warpSize / 2; stride > 0; stride >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, stride); // 将一个warp内的值归约到一个thread(laneId==0)中
+    }
+
+    if (laneId == 0) s_data[warpId] = val; // 将数据搬运到共享内存以便后续block内归约
+    __syncthreads();
+
+    if (warpId == 0) { // 在一个block内归约之前warp归约的结果
+        int warpNum = blockDim.x / warpSize; 
+        val = (laneId < warpNum) ? s_data[laneId] : 0; // 因为s_data可能没有全部用到，所以需要判断
+
+        #pragma unroll
+        for (int stride = warpSize / 2; stride > 0; stride >>= 1) {
+            val += __shfl_down_sync(0xffffffff, val, stride);
+        }
+        if (laneId == 0) atomicAdd(dst, val); // 一个block选择一个线程做atomicAdd，将全部block的值加到dst
+    }
+}
+void iReduceWarpVec4(int *src, int *dst, unsigned int n, int *sum) {
+    dim3 blockSize(256);
+    dim3 gridSize(CEIL(CEIL(n, 4), blockSize.x));  // 在grid维度取 1/4
+
+    int4* packSrc = reinterpret_cast<int4*>(src); 
+    cudaMemset(dst, 0, sizeof(int));
+    
+    kReduceWarpVec4<<<gridSize, blockSize>>>(packSrc, dst, CEIL(n, 4));
     CHECK(cudaDeviceSynchronize());
 
     *sum = 0;
