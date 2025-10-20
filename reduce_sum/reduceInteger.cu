@@ -151,8 +151,10 @@ __global__ void kReduceInterleaved_shared(int *src, int *dst, unsigned int N)
     __syncthreads();
 
     /* in-place reduction in shared memory
-    * for循环从blockDim.x/2开始，消除Bank conflict(Bank conflict定义：只发生在shared memory,相同warp的不同线程访问相同Bank的不同地址。一共32个Bank,每个Bank存储32b或64b)
-    */
+    * for循环从blockDim.x/2开始，消除Bank conflict
+    * Bank conflict定义：只关注在shared memory, 相同warp的不同线程访问相同Bank的不同地址。一共32个Bank,每个Bank存储32bit或64bit
+    * 更严谨的说法：同一memory transaction中的不同线程，既可能少于32个线程(https://forums.developer.nvidia.com/t/how-to-understand-the-bank-conflict-of-shared-mem/260900/2)
+    */ 
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
     {
         if (tid < stride)
