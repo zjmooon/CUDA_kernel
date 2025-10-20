@@ -86,8 +86,10 @@ void iReduceNeighbored(int *src, int *dst, unsigned int n, int *sum) {
 
 
 
-// Interleaved Pair Implementation with less divergence
-// 交错归约，线程束分化程度降低(工作线程连续)，合并访存(全局内存的load/store连续)
+/*
+* Interleaved Pair Implementation with less divergence
+* 交错归约，线程束分化程度降低(工作线程连续)，合并访存(全局内存的load/store连续)
+*/
 __global__ void kReduceInterleaved(int *src, int *dst, unsigned int N)
 {
     unsigned int tid = threadIdx.x;
@@ -136,6 +138,7 @@ void iReduceInterleaved(int *src, int *dst, unsigned int n, int *sum) {
 } 
 
 
+
 template<const int BLOCK_SIZE>
 __global__ void kReduceInterleaved_shared(int *src, int *dst, unsigned int N)
 {
@@ -147,7 +150,9 @@ __global__ void kReduceInterleaved_shared(int *src, int *dst, unsigned int N)
     s_data[tid] = (idx < N) ? src[idx] : 0;
     __syncthreads();
 
-    // in-place reduction in shared memory
+    /* in-place reduction in shared memory
+    * for循环从blockDim.x/2开始，消除Bank conflict(Bank conflict定义：只发生在shared memory,相同warp的不同线程访问相同Bank的不同地址。一共32个Bank,每个Bank存储32b或64b)
+    */
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
     {
         if (tid < stride)
@@ -222,7 +227,9 @@ void iReduceWarp(int *src, int *dst, unsigned int n, int *sum) {
 } 
 
 
-// warp reduce vectorization4
+/* 
+* warp reduce vectorization4
+*/
 __global__ void kReduceWarpVec4(const int4 *src, int *dst, int N4) {
     __shared__ int s_data[32]; // 最多32， 因为一个block最多1024线程，最多1024/32=32warp
 
