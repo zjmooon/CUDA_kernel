@@ -9,9 +9,9 @@
  * parallel reduction in CUDA. For this example, the sum operation is used. A
  * variety of optimizations on parallel reduction aimed at reducing divergence
  * are also demonstrated, such as unrolling.
- */
-// 归约问题：满足结合律和交换律的向量运算
-// 常用的优化方式：循环展开，向量化，block内折半归约，warp内归约(天然同步)
+ * 归约问题：满足结合律和交换律的向量运算，将多个值整合为一个或较少数量值
+ * 常用的优化方式：循环展开，向量化，block内折半归约，warp内归约(天然同步) 
+*/
 
 // Recursive Implementation of Interleaved Pair Approach
 int recursiveReduce(int *data, int const size)
@@ -42,17 +42,17 @@ __global__ void kReduceNeighbored(int *src, int *dst, unsigned int N)
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
+    // boundary check
+    if (idx >= N) return;
+
     // convert global data pointer to the local pointer of this block
     // g_idata + 偏移(blockIdx.x * blockDim.x：当前块在全局中的x方向上的索引)
     // blockIdx.x * blockDim.x：如果在一维网格一维块中
     // 就是表示当前 Block 的第一个线程在整个 Grid 中的全局线程编号起始值
     int *idata = src + blockIdx.x * blockDim.x; 
 
-    // boundary check
-    if (idx >= N) return;
-
     // in-place reduction in global memory
-    for (int stride = 1; stride < blockDim.x; stride *= 2)
+    for (int stride = 1; stride < blockDim.x; stride <<= 1)
     {
         if ((tid % (2 * stride)) == 0)
         {
@@ -67,6 +67,7 @@ __global__ void kReduceNeighbored(int *src, int *dst, unsigned int N)
     // if (tid == 0) dst[blockIdx.x] = idata[0];
 
     // 再做一次归约将每个块的值相加获得总的和
+    // TODO:再做一次归约
     if (tid == 0) atomicAdd(dst, idata[0]);
 }
 void iReduceNeighbored(int *src, int *dst, unsigned int n, int *sum) {
@@ -86,21 +87,21 @@ void iReduceNeighbored(int *src, int *dst, unsigned int n, int *sum) {
 
 
 
-/*
-* Interleaved Pair Implementation with less divergence
-* 交错归约，线程束分化程度降低(工作线程连续)，合并访存(全局内存的load/store连续)
-*/
+// Interleaved Pair Implementation with less divergence
+// 交错归约，解决 warp divergence， 线程束分化程度降低(工作线程连续)，合并访存(全局内存的load/store连续)
+
 __global__ void kReduceInterleaved(int *src, int *dst, unsigned int N)
 {
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
 
     // convert global data pointer to the local pointer of this block
     // g_idata + 偏移(blockIdx.x * blockDim.x：当前块在全局中的x方向上的索引)
     // blockIdx.x * blockDim.x：如果在一维网格一维块中
     // 就是表示当前 Block 的第一个线程在整个 Grid 中的全局线程编号起始值
-    int *idata = src + blockIdx.x * blockDim.x;   // 原始代码
-    if (idx >= N) return;
+    int *idata = src + blockIdx.x * blockDim.x;   
+    
     // idata 是指向当前 block数据 起始地址的指针。
     // 每个 block 的线程只对自己那一段连续的数组片段 idata[0 ~ blockDim.x-1] 进行归约。
 
