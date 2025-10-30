@@ -1,117 +1,295 @@
 #include <iostream>
 #include <cuda_runtime.h>
-#include <opencv2/opencv.hpp>
 #include "../common.h"
+#include <iomanip>
 
-__global__ void sgemmNaive(float* A, float* B, float* C, int M, int N, int K) {
-    uint gx = threadIdx.x + blockIdx.x * blockDim.x;
-    uint gy = threadIdx.y + blockIdx.y * blockDim.y;
+#define BLOCK_SIZE 32
 
-    if (gx >= N || gy >= M) return; // C:(M行×N列)
-
-    float value = 0.0f;
-    for (int i=0; i<K; ++i) {
-        value += A[gy * K + i] * B[i * N + gx];
-    }
-
-    C[gy * N + gx] = value;
-}
-
-
-template<const int BLOCK_SIZE>
-__global__ void sgemmSharedMem(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C) {
-    const int BM = BLOCK_SIZE;
-    const int BN = BLOCK_SIZE;
-    const int BK = BLOCK_SIZE;
-
-    int bx = blockIdx.x; // 当前处理C中哪一列tile
-    int by = blockIdx.y; // 当前处理C中哪一行tile
-    int tx = threadIdx.x % BN;  // 当前线程在tile中横向的坐标
-    int ty = threadIdx.x / BN;  // 当前线程在tile中竖向的坐标
-
-    // 申请共享内存空间
-    // NVIDIA GeForce GTX 4080super's sharedMemPerBlock is 49152 bytes
-    // 1 float takes 4 Bytes, so (BM*BK + BK*BN) should <= 49152/4 = 12288 bytes
-    __shared__ float As[BM * BK];
-    __shared__ float Bs[BK * BN];
-
-    // 移动到当前block
-    A = &A[by * BM * K];
-    B = &B[bx * BN];
-    C = &C[by * BM * N + bx * BN];
-
-    float tmp = 0.;
-    for (int k = 0; k < K; k += BK) {  // 窗口滑动
-        // 缓存A_tile和B_tile
-        As[ty * BK + tx] = A[ty * K + tx];
-        Bs[ty * BN + tx] = B[ty * N + tx];
-        // 同步所有线程缓存完成
-        __syncthreads();  // 同步同一个线程块(block)中的线程，执行到同一个点
-        // 移动A,B指针到下一个矩阵块
-        A += BK;
-        B += BK * N;
-        for (int i = 0; i < BK; i++) {
-            tmp += As[ty * BK + i] * Bs[i * BN + tx];
+// CPU reference: C = A * B
+void sgemm_cpu(int M, int N, int K,
+               const float* A, int lda,
+               const float* B, int ldb,
+               float* C, int ldc)
+{
+    for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < N; ++j) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                // row-major: A[i*lda + k], B[k*ldb + j]
+                sum += A[i*lda + k] * B[k*ldb + j];
+            }
+            C[i*ldc + j] = sum;
         }
-        // FMA计算需要读取缓存数据，在新一轮写入缓存前进行同步，确保所有线程计算完成
-        __syncthreads();
     }
-    C[ty * N + tx] = alpha * tmp + beta * C[ty * N + tx];
 }
 
-// template instantiation declaration
-template __global__ void sgemmSharedMem<16>(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C);
-template __global__ void sgemmSharedMem<32>(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C);
-template __global__ void sgemmSharedMem<64>(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C);
+// Naive per-element kernel
+// Each thread computes one C(i,j)
+__global__ void kSgemmNaive(int M, int N, int K,
+                        const float* __restrict__ A, int lda,
+                        const float* __restrict__ B, int ldb,
+                        float* C, int ldc)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-// Note: pay attention to the `sharedMemPerBlock`,
-// for example, when there is a template instantiation declaration like below:
-// template __global__ void sgemm_v2<128>(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C);
-// compiler will throw error like below:
-// ptxas error   : Entry function '_Z8sgemm_v2ILi128EEviiifPfS0_fS0_' uses too much shared data (0x20000 bytes, 0xc000 max)
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            sum += A[row * lda + k] * B[k * ldb + col];
+        }
+        C[row * ldc + col] = sum;
+    }
+}
+void iSgemmNaive(int M, int N, int K,
+                        const float* __restrict__ A, int lda,
+                        const float* __restrict__ B, int ldb,
+                        float* C, int ldc)
+{
+    dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 gridSize(CEIL(N, BLOCK_SIZE), CEIL(M, BLOCK_SIZE));
+
+    kSgemmNaive<<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
+}
 
 
-
-// const int BLOCK_SIZE = 32;
-// dim3 block(BLOCK_SIZE, BLOCK_SIZE);
-// dim3 grid(CEIL(N,BLOCK_SIZE), CEIL(M,BLOCK_SIZE));  // 根据C矩阵的形状(M行N列)切块
-// sgemm<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
-
-const int BLOCK_SIZE = 32;
-__global__ void sgemm(float* A, float* B, float* C, int M, int N, int K) {
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    int idy = blockDim.y * blockIdx.y + threadIdx.y;
-    if (idx >= M || idy >= N) return; // ? if (idx >= N || idy >= M) return;
-
-    int bx = blockIdx.x;
-    int by = blockIdx.y;
-    int tx = threadIdx.x;
+// Block-tiled kernel with shared memory
+// Row-major assumed. TILE_DIM should divide or handle boundaries.
+template <int TILE_DIM>
+__global__ void kSgemmBlockTiled(int M, int N, int K,
+                        const float* __restrict__ A, int lda,
+                        const float* __restrict__ B, int ldb,
+                        float* C, int ldc)
+{
+    // thread coords within block
     int ty = threadIdx.y;
+    int tx = threadIdx.x;
 
-    const int BM = BLOCK_SIZE;
-    const int BN = BLOCK_SIZE;
-    const int BK = BLOCK_SIZE;
-    __shared__ float As[BM * BK];
-    __shared__ float Bs[BK * BN];
+    // global row/col this thread will compute
+    int cx = blockIdx.x * TILE_DIM + tx;
+    int cy = blockIdx.y * TILE_DIM + ty;
 
-    // 初始化block tile起始位置
-    A = &A[(by * BM) * K];
-    B = &B[bx * BN];
-    C = &C[(by * BM) * N + bx * BN];
+    // shared tiles
+    __shared__ float sA[TILE_DIM][TILE_DIM];
+    __shared__ float sB[TILE_DIM][TILE_DIM];
 
-    float accum = 0.0f;
-    for (int k = 0; k < K; k += BK) {
-        // 搬运 global ==> shared
-        As[ty * BK + tx] = A[ty * K + tx];
-        Bs[ty * BN + tx] = B[ty * N + tx];
+    float acc = 0.0f;
+
+    // Loop over tiles of A and B
+    // For each tile t, we load A[cy, t*TILE_DIM + tx] and B[t*TILE_DIM + ty, cx]
+    int numTiles = (K + TILE_DIM - 1) / TILE_DIM;
+    for (int t = 0; t < numTiles; ++t) {
+        int ax = t * TILE_DIM + tx; // column index in A
+        int by = t * TILE_DIM + ty; // row index in B
+
+        // Load A tile element (cy, ax)
+        // if (cy < M && ax < K) {
+        //     sA[ty][tx] = A[cy * lda + ax];
+        // } else {
+        //     sA[ty][tx] = 0.0f;
+        // }
+        // // Load B tile element (by, cx)
+        // if (by < K && cx < N) {
+        //     sB[ty][tx] = B[by * ldb + cx];
+        // } else {
+        //     sB[ty][tx] = 0.0f;
+        // }
+        // 简单的三目运算符可由nvcc编译为selp指令，性能较if语句好
+        sA[ty][tx] = (cy < M && ax < K) ? A[cy * lda + ax] : 0.0f;
+        sB[ty][tx] = (by < K && cx < N) ? B[by * ldb + cx] : 0.0f;
+
         __syncthreads();
-        A = A + BK;
-        B = B + BK * N;
-        for (int i = 0; i < BK; i++) {
-            accum += As[ty * BK + i] * Bs[i * BN + tx];
+
+        // Multiply-accumulate over the tile
+        #pragma unroll
+        for (int k = 0; k < TILE_DIM; ++k) {
+            acc += sA[ty][k] * sB[k][tx];
         }
         __syncthreads();
     }
 
-    C[ty * N + tx] = accum;
+    if (cy < M && cx < N) {
+        C[cy * ldc + cx] = acc;
+    }
+}
+void iSgemmBlockTiled(int M, int N, int K,
+                        const float* __restrict__ A, int lda,
+                        const float* __restrict__ B, int ldb,
+                        float* C, int ldc)
+{
+    dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 gridSize(CEIL(N, BLOCK_SIZE), CEIL(M, BLOCK_SIZE));
+
+    kSgemmBlockTiled<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
+}
+
+
+template <int TILE_DIM>
+__global__ void kSgemmBlockTiled_V2(int M, int N, int K,
+                        const float* __restrict__ A, int lda,
+                        const float* __restrict__ B, int ldb,
+                        float* C, int ldc) 
+{
+    const int gx = threadIdx.x + blockDim.x * blockIdx.x; 
+    const int gy = threadIdx.y + blockDim.y * blockIdx.y; 
+
+    if (gx >= N || gy >= M) return;
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    __shared__ float sA[TILE_DIM][TILE_DIM];
+    __shared__ float sB[TILE_DIM][TILE_DIM];
+    /* __shared__ float sA[TILE_DIM * TILE_DIM];
+    __shared__ float sB[TILE_DIM * TILE_DIM]; */
+
+    A = &A[lda * TILE_DIM * blockIdx.y];
+    B = &B[TILE_DIM * blockIdx.x];
+    C = &C[ldc * TILE_DIM * blockIdx.y + TILE_DIM * blockIdx.x];
+
+    float acc = 0.0f;
+    for (int k = 0; k < K; k += TILE_DIM) {
+        sA[ty][tx] = A[ty * lda + tx];
+        sB[ty][tx] = B[ty * ldb + tx];
+        /* sA[ty * TILE_DIM + tx] = A[ty * lda + tx];
+        sB[ty * TILE_DIM + tx] = B[ty * ldb + tx];  */      
+        __syncthreads();
+
+        A += TILE_DIM;
+        B += TILE_DIM * ldb;
+
+        for (int i = 0; i < TILE_DIM; i++) {
+            acc += sA[ty][i] * sB[i][tx];
+            // acc += sA[ty * TILE_DIM + i] * sB[i * TILE_DIM + tx];
+        }
+        __syncthreads();
+    }
+
+    C[ty * ldc + tx] = acc;   // 不是 C[gy * ldc + gx] = acc, 因为C首地址已经移动到局部了
+}
+void iSgemmBlockTiled_V2(int M, int N, int K,
+                        const float* __restrict__ A, int lda,
+                        const float* __restrict__ B, int ldb,
+                        float* C, int ldc)
+{
+    dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 gridSize(CEIL(N, BLOCK_SIZE), CEIL(M, BLOCK_SIZE));
+
+    kSgemmBlockTiled_V2<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
+}
+
+// initialize matrix
+void rand_matrix(float* mat, int rows, int cols, int ld) {
+    for (int i = 0; i < rows; ++i)
+        for (int j = 0; j < cols; ++j)
+            mat[i*ld + j] = (float(rand()) / RAND_MAX) * 2.0f - 1.0f;
+}
+
+void verifyResult(const float* host, const float* kernel, size_t size, double eps = 1e-3)
+{
+    double max_abs_err = 0.0;
+    double sum_abs_err = 0.0;
+    size_t num_bad = 0;
+
+    for (size_t i = 0; i < size; ++i)
+    {
+        double diff = std::fabs(static_cast<double>(host[i]) - static_cast<double>(kernel[i]));
+        double abs_ref = std::fabs(static_cast<double>(host[i]));
+        double rel_err = (abs_ref > 1e-6) ? diff / abs_ref : diff;
+
+        if (rel_err > eps) {
+            ++num_bad;
+            // std::cout << "host " << host[i] << ", kernel " << kernel[i] << std::endl;
+        }
+
+        if (diff > max_abs_err)
+            max_abs_err = diff;
+        sum_abs_err += diff;
+    }
+
+    double mean_abs_err = sum_abs_err / static_cast<double>(size);
+
+    std::cout << "Verification Result:\n"
+              << std::scientific << std::setprecision(6)
+              << "  Max abs error   = " << max_abs_err << "\n"
+              << "  Mean abs error  = " << mean_abs_err << "\n"
+              << "  Error tolerance = " << eps << "\n"
+              << "  Mismatched elements = " << num_bad << " / " << size << "\n";
+}
+
+
+
+int main(int argc, char** argv)
+{
+    int repeat_times = 10;
+    double iStart, iElaps;
+    int M = 1024 * 2;
+    int N = 1024 * 2;
+    int K = 1024 * 2;
+    float total_time;
+
+    // Leading dims (row-major)行主序
+    int lda = K;
+    int ldb = N;
+    int ldc = N;
+    size_t sizeA = (size_t)M * lda;
+    size_t sizeB = (size_t)K * ldb;
+    size_t sizeC = (size_t)M * ldc;
+
+    // allocate host memory
+    float* hA = (float*)malloc(sizeA * sizeof(float));
+    float* hB = (float*)malloc(sizeB * sizeof(float));
+    float* hC = (float*)malloc(sizeC * sizeof(float));
+    float* kernel_C = (float*)malloc(sizeC * sizeof(float));
+
+    rand_matrix(hA, M, K, lda); // (M行K列)
+    rand_matrix(hB, K, N, ldb); // (K行N列)
+    memset(hC, 0, sizeC * sizeof(float)); // (M行N列)
+    memset(kernel_C, 0, sizeC * sizeof(float)); // (M行N列)
+    // rand_matrix(hC, M, N, ldc); 
+
+
+    // allocate deveice memory
+    float *dA, *dB, *dC;
+    CHECK(cudaMalloc(reinterpret_cast<void **>(&dA), sizeA * sizeof(float)));
+    CHECK(cudaMalloc(reinterpret_cast<void **>(&dB), sizeB * sizeof(float)));
+    CHECK(cudaMalloc(reinterpret_cast<void **>(&dC), sizeC * sizeof(float)));
+
+    // copy H -> D
+    CHECK(cudaMemcpy(dA, hA, sizeA * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(dB, hB, sizeB * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(dC, hC, sizeC * sizeof(float), cudaMemcpyHostToDevice));
+
+    // CPU reference (for correctness)
+    iStart = seconds();
+    sgemm_cpu(M, N, K, hA, lda, hB, ldb, hC, ldc);
+    iElaps = seconds() - iStart;
+    std::cout << GREEN << "[host]: elapsed = " << iElaps * 1000 << " ms, " << RESET << std::endl << std::endl;
+
+    // navie
+    total_time = TIME_RECORD(repeat_times, ([&]{iSgemmNaive(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
+    std::cout << GREEN << std::endl << "[device navie]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    CHECK(cudaMemcpy(hC, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
+    // verifyResult(hC, kernel_C, M * N, 1e-3);  
+
+    total_time = TIME_RECORD(repeat_times, ([&]{iSgemmBlockTiled(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
+    std::cout << GREEN << std::endl << "[device block tile]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(hC, kernel_C, M * N, 1e-3);  
+
+    total_time = TIME_RECORD(repeat_times, ([&]{iSgemmBlockTiled_V2(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
+    std::cout << GREEN << std::endl << "[device block tile (another version)]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(hC, kernel_C, M * N, 1e-3);  
+
+    // cleanup
+    cudaFree(dA); 
+    cudaFree(dB); 
+    cudaFree(dC);
+    free(hA); 
+    free(hB); 
+    free(hC); 
+    free(kernel_C);
+
+    return 1;
 }

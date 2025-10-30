@@ -270,7 +270,7 @@ int main(int argc, char **argv)
     cudaMemcpy(kernel_result, d_dst, M * N * sizeof(int), cudaMemcpyDeviceToHost);
     verifyResult(host_result, kernel_result, N, M); 
 
-    // free host and device memory
+    // cleanup
     CHECK(cudaFree(d_src));
     CHECK(cudaFree(d_dst));
     free(h_src);
