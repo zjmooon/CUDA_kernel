@@ -104,7 +104,7 @@ __global__ void kTransposeSharedCoalesce(const int *src, int *dst, const int M, 
     __shared__ int s_data[blockSize][blockSize]; 
 
     if (gx < N && gy < M) {
-        s_data[threadIdx.y][threadIdx.x] = src[gy * N + gx]; // 全局内存合并读取
+        s_data[threadIdx.y][threadIdx.x] = src[gy * N + gx]; // 全局内存合并读取 共享内存无Bank Conflict
     }
     __syncthreads();
 

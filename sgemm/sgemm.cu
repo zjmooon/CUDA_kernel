@@ -53,79 +53,9 @@ void iSgemmNaive(int M, int N, int K,
 }
 
 
-// Block-tiled kernel with shared memory
-// Row-major assumed. TILE_DIM should divide or handle boundaries.
+
 template <int TILE_DIM>
 __global__ void kSgemmBlockTiled(int M, int N, int K,
-                        const float* __restrict__ A, int lda,
-                        const float* __restrict__ B, int ldb,
-                        float* C, int ldc)
-{
-    // thread coords within block
-    int ty = threadIdx.y;
-    int tx = threadIdx.x;
-
-    // global row/col this thread will compute
-    int cx = blockIdx.x * TILE_DIM + tx;
-    int cy = blockIdx.y * TILE_DIM + ty;
-
-    // shared tiles
-    __shared__ float sA[TILE_DIM][TILE_DIM];
-    __shared__ float sB[TILE_DIM][TILE_DIM];
-
-    float acc = 0.0f;
-
-    // Loop over tiles of A and B
-    // For each tile t, we load A[cy, t*TILE_DIM + tx] and B[t*TILE_DIM + ty, cx]
-    int numTiles = (K + TILE_DIM - 1) / TILE_DIM;
-    for (int t = 0; t < numTiles; ++t) {
-        int ax = t * TILE_DIM + tx; // column index in A
-        int by = t * TILE_DIM + ty; // row index in B
-
-        // Load A tile element (cy, ax)
-        // if (cy < M && ax < K) {
-        //     sA[ty][tx] = A[cy * lda + ax];
-        // } else {
-        //     sA[ty][tx] = 0.0f;
-        // }
-        // // Load B tile element (by, cx)
-        // if (by < K && cx < N) {
-        //     sB[ty][tx] = B[by * ldb + cx];
-        // } else {
-        //     sB[ty][tx] = 0.0f;
-        // }
-        // 简单的三目运算符可由nvcc编译为selp指令，性能较if语句好
-        sA[ty][tx] = (cy < M && ax < K) ? A[cy * lda + ax] : 0.0f;
-        sB[ty][tx] = (by < K && cx < N) ? B[by * ldb + cx] : 0.0f;
-
-        __syncthreads();
-
-        // Multiply-accumulate over the tile
-        #pragma unroll
-        for (int k = 0; k < TILE_DIM; ++k) {
-            acc += sA[ty][k] * sB[k][tx];
-        }
-        __syncthreads();
-    }
-
-    if (cy < M && cx < N) {
-        C[cy * ldc + cx] = acc;
-    }
-}
-void iSgemmBlockTiled(int M, int N, int K,
-                        const float* __restrict__ A, int lda,
-                        const float* __restrict__ B, int ldb,
-                        float* C, int ldc)
-{
-    dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 gridSize(CEIL(N, BLOCK_SIZE), CEIL(M, BLOCK_SIZE));
-
-    kSgemmBlockTiled<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
-}
-
-
-template <int TILE_DIM>
-__global__ void kSgemmBlockTiled_V2(int M, int N, int K,
                         const float* __restrict__ A, int lda,
                         const float* __restrict__ B, int ldb,
                         float* C, int ldc) 
@@ -148,6 +78,8 @@ __global__ void kSgemmBlockTiled_V2(int M, int N, int K,
     C = &C[ldc * TILE_DIM * blockIdx.y + TILE_DIM * blockIdx.x];
 
     float acc = 0.0f;
+
+    # pragma unroll
     for (int k = 0; k < K; k += TILE_DIM) {
         sA[ty][tx] = A[ty * lda + tx];
         sB[ty][tx] = B[ty * ldb + tx];
@@ -158,14 +90,76 @@ __global__ void kSgemmBlockTiled_V2(int M, int N, int K,
         A += TILE_DIM;
         B += TILE_DIM * ldb;
 
+        # pragma unroll
         for (int i = 0; i < TILE_DIM; i++) {
             acc += sA[ty][i] * sB[i][tx];
+            // sB load不存在Bank conflict
             // acc += sA[ty * TILE_DIM + i] * sB[i * TILE_DIM + tx];
         }
         __syncthreads();
     }
 
     C[ty * ldc + tx] = acc;   // 不是 C[gy * ldc + gx] = acc, 因为C首地址已经移动到局部了
+}
+void iSgemmBlockTiled(int M, int N, int K,
+                        const float* __restrict__ A, int lda,
+                        const float* __restrict__ B, int ldb,
+                        float* C, int ldc)
+{
+    dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 gridSize(CEIL(N, BLOCK_SIZE), CEIL(M, BLOCK_SIZE));
+
+    kSgemmBlockTiled<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
+}
+
+
+
+// Block-tiled kernel with shared memory
+// Row-major assumed. TILE_DIM should divide or handle boundaries.
+template <int TILE_DIM>
+__global__ void kSgemmBlockTiled_V2(int M, int N, int K,
+                        const float* __restrict__ A, int lda,
+                        const float* __restrict__ B, int ldb,
+                        float* C, int ldc)
+{
+    // thread coords within block
+    int ty = threadIdx.y;
+    int tx = threadIdx.x;
+
+    // global row/col this thread will compute
+    int cx = blockIdx.x * TILE_DIM + tx;
+    int cy = blockIdx.y * TILE_DIM + ty;
+
+    // shared tiles
+    __shared__ float sA[TILE_DIM][TILE_DIM];
+    __shared__ float sB[TILE_DIM][TILE_DIM];
+
+    float acc = 0.0f;
+
+    # pragma unroll
+    for (int k_tile = 0; k_tile < K; k_tile += TILE_DIM) {
+        int ax = k_tile + tx;
+        int by = k_tile + ty; 
+
+        // 简单的三目运算符可由nvcc编译为selp指令，性能较if语句好
+        // 全局内存load合并访存，共享内存store不Bank conflict
+        sA[ty][tx] = (cy < M && ax < K) ? A[cy * lda + ax] : 0.0f;
+        sB[ty][tx] = (by < K && cx < N) ? B[by * ldb + cx] : 0.0f;
+
+        __syncthreads();
+
+        // Multiply-accumulate over the tile
+        #pragma unroll
+        for (int k = 0; k < TILE_DIM; ++k) {
+            acc += sA[ty][k] * sB[k][tx];
+            // sB[][] load存在Bank conflict (padding解决)
+        }
+        __syncthreads();
+    }
+
+    if (cy < M && cx < N) {
+        C[cy * ldc + cx] = acc;
+    }
 }
 void iSgemmBlockTiled_V2(int M, int N, int K,
                         const float* __restrict__ A, int lda,
@@ -177,6 +171,8 @@ void iSgemmBlockTiled_V2(int M, int N, int K,
 
     kSgemmBlockTiled_V2<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
 }
+
+
 
 // initialize matrix
 void rand_matrix(float* mat, int rows, int cols, int ld) {
@@ -221,7 +217,7 @@ void verifyResult(const float* host, const float* kernel, size_t size, double ep
 
 int main(int argc, char** argv)
 {
-    int repeat_times = 10;
+    int repeat_times = 5;
     double iStart, iElaps;
     int M = 1024 * 2;
     int N = 1024 * 2;

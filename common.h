@@ -20,7 +20,7 @@
 #define TIME_RECORD(N, func)                                                                    \
     [&] {                                                                                       \
         float total_time = 0;                                                                   \
-        for (int repeat = 0; repeat <= N; ++repeat) {                                           \
+        for (int repeat = 0; repeat < N; ++repeat) {                                           \
             cudaEvent_t start, stop;                                                            \
             CHECK(cudaEventCreate(&start));                                                 \
             CHECK(cudaEventCreate(&stop));                                                  \
