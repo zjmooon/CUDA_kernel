@@ -54,8 +54,68 @@ void iSgemmNaive(int M, int N, int K,
 
 
 
+// Block-tiled kernel with shared memory
+// Row-major assumed. TILE_DIM should divide or handle boundaries.
 template <int TILE_DIM>
 __global__ void kSgemmBlockTiled(int M, int N, int K,
+                        const float* __restrict__ A, int lda,
+                        const float* __restrict__ B, int ldb,
+                        float* C, int ldc)
+{
+    // thread coords within block
+    int ty = threadIdx.y;
+    int tx = threadIdx.x;
+
+    // global row/col this thread will compute
+    int cx = blockIdx.x * TILE_DIM + tx;
+    int cy = blockIdx.y * TILE_DIM + ty;
+
+    // shared tiles
+    __shared__ float sA[TILE_DIM][TILE_DIM];
+    __shared__ float sB[TILE_DIM][TILE_DIM];
+
+    float acc = 0.0f;
+
+    # pragma unroll
+    for (int k = 0; k < K; k += TILE_DIM) {
+        int ax = k + tx;
+        int by = k + ty; 
+
+        // 简单的三目运算符可由nvcc编译为selp指令，性能较if语句好
+        // 全局内存load合并访存，共享内存store不Bank conflict
+        sA[ty][tx] = (cy < M && ax < K) ? A[cy * lda + ax] : 0.0f;
+        sB[ty][tx] = (by < K && cx < N) ? B[by * ldb + cx] : 0.0f;
+
+        __syncthreads();
+
+        // Multiply-accumulate over the tile
+        #pragma unroll
+        for (int k_inner = 0; k_inner < TILE_DIM; ++k_inner) {
+            acc += sA[ty][k_inner] * sB[k_inner][tx];
+            // sB[][] load不存在Bank conflict
+        }
+        __syncthreads();
+    }
+
+    if (cy < M && cx < N) {
+        C[cy * ldc + cx] = acc;
+    }
+}
+void iSgemmBlockTiled(int M, int N, int K,
+                        const float* __restrict__ A, int lda,
+                        const float* __restrict__ B, int ldb,
+                        float* C, int ldc)
+{
+    dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 gridSize(CEIL(N, BLOCK_SIZE), CEIL(M, BLOCK_SIZE));
+
+    kSgemmBlockTiled<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
+}
+
+
+
+template <int TILE_DIM>
+__global__ void kSgemmBlockTiled2(int M, int N, int K,
                         const float* __restrict__ A, int lda,
                         const float* __restrict__ B, int ldb,
                         float* C, int ldc) 
@@ -91,17 +151,17 @@ __global__ void kSgemmBlockTiled(int M, int N, int K,
         B += TILE_DIM * ldb;
 
         # pragma unroll
-        for (int i = 0; i < TILE_DIM; i++) {
-            acc += sA[ty][i] * sB[i][tx];
+        for (int k_inner = 0; k_inner < TILE_DIM; k_inner++) {
+            acc += sA[ty][k_inner] * sB[k_inner][tx];
             // sB load不存在Bank conflict
-            // acc += sA[ty * TILE_DIM + i] * sB[i * TILE_DIM + tx];
+            // acc += sA[ty * TILE_DIM + k_inner] * sB[k_inner * TILE_DIM + tx];
         }
         __syncthreads();
     }
 
     C[ty * ldc + tx] = acc;   // 不是 C[gy * ldc + gx] = acc, 因为C首地址已经移动到局部了
 }
-void iSgemmBlockTiled(int M, int N, int K,
+void iSgemmBlockTiled2(int M, int N, int K,
                         const float* __restrict__ A, int lda,
                         const float* __restrict__ B, int ldb,
                         float* C, int ldc)
@@ -109,67 +169,89 @@ void iSgemmBlockTiled(int M, int N, int K,
     dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
     dim3 gridSize(CEIL(N, BLOCK_SIZE), CEIL(M, BLOCK_SIZE));
 
-    kSgemmBlockTiled<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
+    kSgemmBlockTiled2<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
 
 
-// Block-tiled kernel with shared memory
-// Row-major assumed. TILE_DIM should divide or handle boundaries.
-template <int TILE_DIM>
-__global__ void kSgemmBlockTiled_V2(int M, int N, int K,
+template <const int BLOCK_TILE, const int BK, const int THREAD_TILE>
+__global__ void kSgemmThreadTiled(int M, int N, int K,
                         const float* __restrict__ A, int lda,
                         const float* __restrict__ B, int ldb,
                         float* C, int ldc)
 {
-    // thread coords within block
-    int ty = threadIdx.y;
-    int tx = threadIdx.x;
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    
+    const int BM = BLOCK_TILE;
+    const int BN = BLOCK_TILE;
+    const int TM = THREAD_TILE;
+    const int TN = THREAD_TILE;
+    
+    __shared__ float As[BM * BK];
+    __shared__ float Bs[BK * BN];
 
-    // global row/col this thread will compute
-    int cx = blockIdx.x * TILE_DIM + tx;
-    int cy = blockIdx.y * TILE_DIM + ty;
+    A = &A[by * lda * BM * TM]; // BM * TM是block版本的blockDim.x
+    B = &B[bx * BN * TN]; // BN * TN是block版本的blockDim.y
+    C = &C[by * ldc * BM * TM + bx * BN * TN];
 
-    // shared tiles
-    __shared__ float sA[TILE_DIM][TILE_DIM];
-    __shared__ float sB[TILE_DIM][TILE_DIM];
+    float acc[TM * TN] = {0.0f}; // 一个线程处理TM*TN的数据
 
-    float acc = 0.0f;
-
-    # pragma unroll
-    for (int k_tile = 0; k_tile < K; k_tile += TILE_DIM) {
-        int ax = k_tile + tx;
-        int by = k_tile + ty; 
-
-        // 简单的三目运算符可由nvcc编译为selp指令，性能较if语句好
-        // 全局内存load合并访存，共享内存store不Bank conflict
-        sA[ty][tx] = (cy < M && ax < K) ? A[cy * lda + ax] : 0.0f;
-        sB[ty][tx] = (by < K && cx < N) ? B[by * ldb + cx] : 0.0f;
-
+    #pragma unroll
+    for (int k = 0; k < K; k += BK) {
+        #pragma unroll // 从global memory搬运到shared memory
+        for (int i = 0; i < THREAD_TILE; i++) {
+            const int sy = ty * TM + i;
+            const int sx = tx * TN + i;
+            if (sy >= BM || sx >= BN) return;
+            
+            As[sy * BK + tx] = A[sy * lda + tx];
+            Bs[ty * BN + sx] = B[ty * ldb + sx];
+        }
         __syncthreads();
 
-        // Multiply-accumulate over the tile
+        A += BK;
+        B += BK * ldb;
+
         #pragma unroll
-        for (int k = 0; k < TILE_DIM; ++k) {
-            acc += sA[ty][k] * sB[k][tx];
-            // sB[][] load存在Bank conflict (padding解决)
+        for (int k_inner = 0; k_inner < BK; k_inner++) {
+            #pragma unroll
+            for (int y = 0; y < TM; y++) {
+                #pragma unroll
+                for (int x = 0; x < TN; x++) {
+                    acc[y * TN + x] += As[(ty * TM + y) * BK + k_inner] *
+                                       Bs[k_inner * BN + (tx * TN + x)];
+                }
+            }
         }
         __syncthreads();
     }
 
-    if (cy < M && cx < N) {
-        C[cy * ldc + cx] = acc;
+    #pragma unroll
+    for (int y = 0; y < TM; y++) {
+        #pragma unroll
+        for (int x = 0; x < TN; x++) {
+            if ((ty * TM + y) + by * (BM * TM) < M && (tx + TN + x) + bx * (BN * TN) < N) {
+                C[(ty * TM + y) * N + (tx * TN + x)] = acc[y * TN + x];
+            }
+        }
     }
 }
-void iSgemmBlockTiled_V2(int M, int N, int K,
+void iSgemmThreadTiled(int M, int N, int K,
                         const float* __restrict__ A, int lda,
                         const float* __restrict__ B, int ldb,
                         float* C, int ldc)
 {
-    dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 gridSize(CEIL(N, BLOCK_SIZE), CEIL(M, BLOCK_SIZE));
+    const int block_tile = 32;
+    const int thread_tile = 4; 
+    dim3 blockSize(block_tile, block_tile);
+    dim3 gridSize(CEIL(N, block_tile * thread_tile), CEIL(M, block_tile * thread_tile));
+    kSgemmThreadTiled<block_tile, 32, thread_tile><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
 
-    kSgemmBlockTiled_V2<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
+    CHECK(cudaGetLastError());
+    CHECK(cudaDeviceSynchronize());
 }
 
 
@@ -263,20 +345,34 @@ int main(int argc, char** argv)
     std::cout << GREEN << "[host]: elapsed = " << iElaps * 1000 << " ms, " << RESET << std::endl << std::endl;
 
     // navie
+    CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{iSgemmNaive(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
     std::cout << GREEN << std::endl << "[device navie]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
-    CHECK(cudaMemcpy(hC, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
-    // verifyResult(hC, kernel_C, M * N, 1e-3);  
+    memset(kernel_C, 0, sizeC * sizeof(float));
+    CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(hC, kernel_C, M * N, 1e-3);  
 
+    CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{iSgemmBlockTiled(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
     std::cout << GREEN << std::endl << "[device block tile]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(kernel_C, 0, sizeC * sizeof(float));
     CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(hC, kernel_C, M * N, 1e-3);  
 
-    total_time = TIME_RECORD(repeat_times, ([&]{iSgemmBlockTiled_V2(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
+    CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
+    total_time = TIME_RECORD(repeat_times, ([&]{iSgemmBlockTiled2(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
     std::cout << GREEN << std::endl << "[device block tile (another version)]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(kernel_C, 0, sizeC * sizeof(float));
     CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(hC, kernel_C, M * N, 1e-3);  
+
+    CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
+    total_time = TIME_RECORD(repeat_times, ([&]{iSgemmThreadTiled(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
+    std::cout << GREEN << std::endl << "[device thread tile]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(kernel_C, 0, sizeC * sizeof(float));
+    CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(hC, kernel_C, M * N, 1e-3);  
+
 
     // cleanup
     cudaFree(dA); 
