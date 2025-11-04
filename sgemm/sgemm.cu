@@ -128,23 +128,21 @@ __global__ void kSgemmBlockTiled2(int M, int N, int K,
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
 
-    __shared__ float sA[TILE_DIM][TILE_DIM];
-    __shared__ float sB[TILE_DIM][TILE_DIM];
-    /* __shared__ float sA[TILE_DIM * TILE_DIM];
-    __shared__ float sB[TILE_DIM * TILE_DIM]; */
+    __shared__ float As[TILE_DIM][TILE_DIM];
+    __shared__ float Bs[TILE_DIM][TILE_DIM];
+    /* __shared__ float As[TILE_DIM * TILE_DIM];
+    __shared__ float Bs[TILE_DIM * TILE_DIM]; */
 
     A = &A[lda * TILE_DIM * blockIdx.y];
     B = &B[TILE_DIM * blockIdx.x];
-    C = &C[ldc * TILE_DIM * blockIdx.y + TILE_DIM * blockIdx.x];
-
     float acc = 0.0f;
 
     # pragma unroll
     for (int k = 0; k < K; k += TILE_DIM) {
-        sA[ty][tx] = A[ty * lda + tx];
-        sB[ty][tx] = B[ty * ldb + tx];
-        /* sA[ty * TILE_DIM + tx] = A[ty * lda + tx];
-        sB[ty * TILE_DIM + tx] = B[ty * ldb + tx];  */      
+        As[ty][tx] = A[ty * lda + tx];
+        Bs[ty][tx] = B[ty * ldb + tx];
+        /* As[ty * TILE_DIM + tx] = A[ty * lda + tx];
+        Bs[ty * TILE_DIM + tx] = B[ty * ldb + tx];  */      
         __syncthreads();
 
         A += TILE_DIM;
@@ -152,13 +150,14 @@ __global__ void kSgemmBlockTiled2(int M, int N, int K,
 
         # pragma unroll
         for (int k_inner = 0; k_inner < TILE_DIM; k_inner++) {
-            acc += sA[ty][k_inner] * sB[k_inner][tx];
-            // sB load不存在Bank conflict
-            // acc += sA[ty * TILE_DIM + k_inner] * sB[k_inner * TILE_DIM + tx];
+            acc += As[ty][k_inner] * Bs[k_inner][tx];
+            // Bs load不存在Bank conflict
+            // acc += As[ty * TILE_DIM + k_inner] * Bs[k_inner * TILE_DIM + tx];
         }
         __syncthreads();
     }
 
+    C = &C[ldc * TILE_DIM * blockIdx.y + TILE_DIM * blockIdx.x];
     C[ty * ldc + tx] = acc;   // 不是 C[gy * ldc + gx] = acc, 因为C首地址已经移动到局部了
 }
 void iSgemmBlockTiled2(int M, int N, int K,
@@ -174,68 +173,75 @@ void iSgemmBlockTiled2(int M, int N, int K,
 
 
 
-template <const int BLOCK_TILE, const int BK, const int THREAD_TILE>
+template <const int BLOCK_TILE, const int THREAD_TILE>
 __global__ void kSgemmThreadTiled(int M, int N, int K,
                         const float* __restrict__ A, int lda,
                         const float* __restrict__ B, int ldb,
                         float* C, int ldc)
 {
-    const int bx = blockIdx.x;
-    const int by = blockIdx.y;
+    /* 
+    * thread tile版本与block tile版本相比，区别在于tt中一个线程会负责C中THREAD_TILE*THREAD_TILE个数据。计算访存比会更高，提高线程利用率
+    * 所以需要更改的地方有： 
+    * TILE_DIM ---> BLOCK_TILE * THREAD_TILE
+    * 两层循环将数据搬运到shared memory和register memory
+    * tx ---> tx + x * BLOCK_TILE 
+    * ty ---> ty + i * BLOCK_TILE
+    */
+
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
+    constexpr int TILE_DIM = BLOCK_TILE * THREAD_TILE; // 数据布局
     
-    const int BM = BLOCK_TILE;
-    const int BN = BLOCK_TILE;
-    const int TM = THREAD_TILE;
-    const int TN = THREAD_TILE;
-    
-    __shared__ float As[BM * BK];
-    __shared__ float Bs[BK * BN];
+    __shared__ float As[TILE_DIM][TILE_DIM]; // BLOCK_TILE*BLOCK_TILE --> BLOCK_TILE*THREAD_TILE*BLOCK_TILE*THREAD_TILE
+    __shared__ float Bs[TILE_DIM][TILE_DIM]; // 因为线程布局不在与数据布局相同，一个线程现在要处理THREAD_TILE*THREAD_TILE倍数据
 
-    A = &A[by * lda * BM * TM]; // BM * TM是block版本的blockDim.x
-    B = &B[bx * BN * TN]; // BN * TN是block版本的blockDim.y
-    C = &C[by * ldc * BM * TM + bx * BN * TN];
-
-    float acc[TM * TN] = {0.0f}; // 一个线程处理TM*TN的数据
+    A = &A[blockIdx.y * TILE_DIM * lda]; 
+    B = &B[blockIdx.x * TILE_DIM];       
+    float acc[THREAD_TILE][THREAD_TILE] = {0.0f}; // 一个线程处理THREAD_TILE * THREAD_TILE的数据
 
     #pragma unroll
-    for (int k = 0; k < K; k += BK) {
-        #pragma unroll // 从global memory搬运到shared memory
-        for (int i = 0; i < THREAD_TILE; i++) {
-            const int sy = ty * TM + i;
-            const int sx = tx * TN + i;
-            if (sy >= BM || sx >= BN) return;
-            
-            As[sy * BK + tx] = A[sy * lda + tx];
-            Bs[ty * BN + sx] = B[ty * ldb + sx];
+    for (int k = 0; k < K; k += TILE_DIM) 
+    {
+        // 从global memory加载A到shared memory
+        #pragma unroll
+        for (int i = 0; i < THREAD_TILE; i++) 
+        {
+            #pragma unroll
+            for (int j = 0; j < THREAD_TILE; j++) 
+            {
+                As[ty + i * BLOCK_TILE][tx + j * BLOCK_TILE] = A[(ty + BLOCK_TILE * i) * lda + tx + j * BLOCK_TILE];
+                Bs[ty + i * BLOCK_TILE][tx + j * BLOCK_TILE] = B[(ty + BLOCK_TILE * i) * ldb + tx + j * BLOCK_TILE];
+            }
         }
         __syncthreads();
 
-        A += BK;
-        B += BK * ldb;
-
+        // 移动到下一个K维度tile
+        A += TILE_DIM; //
+        B += TILE_DIM * ldb;
+        
         #pragma unroll
-        for (int k_inner = 0; k_inner < BK; k_inner++) {
+        for (int i = 0; i < THREAD_TILE; i++) 
+        {
             #pragma unroll
-            for (int y = 0; y < TM; y++) {
+            for (int j = 0; j < THREAD_TILE; j++) 
+            {
                 #pragma unroll
-                for (int x = 0; x < TN; x++) {
-                    acc[y * TN + x] += As[(ty * TM + y) * BK + k_inner] *
-                                       Bs[k_inner * BN + (tx * TN + x)];
+                for (int k_inner = 0; k_inner < TILE_DIM; k_inner++) 
+                { 
+                    acc[i][j] += As[ty + i * BLOCK_TILE][k_inner] * Bs[k_inner][tx + j * BLOCK_TILE]; 
                 }
             }
         }
         __syncthreads();
     }
-
+    
+    C = &C[blockIdx.y * TILE_DIM * ldc + blockIdx.x * TILE_DIM]; 
+    // 写回结果到global memory
     #pragma unroll
-    for (int y = 0; y < TM; y++) {
+    for (int i = 0; i < THREAD_TILE; i++) {
         #pragma unroll
-        for (int x = 0; x < TN; x++) {
-            if ((ty * TM + y) + by * (BM * TM) < M && (tx + TN + x) + bx * (BN * TN) < N) {
-                C[(ty * TM + y) * N + (tx * TN + x)] = acc[y * TN + x];
-            }
+        for (int j = 0; j < THREAD_TILE; j++) {
+            C[(ty + i * BLOCK_TILE) * ldc + tx + j * BLOCK_TILE] = acc[i][j]; 
         }
     }
 }
@@ -244,11 +250,11 @@ void iSgemmThreadTiled(int M, int N, int K,
                         const float* __restrict__ B, int ldb,
                         float* C, int ldc)
 {
-    const int block_tile = 32;
-    const int thread_tile = 4; 
+    const int block_tile = 16;
+    const int thread_tile = 2; 
     dim3 blockSize(block_tile, block_tile);
     dim3 gridSize(CEIL(N, block_tile * thread_tile), CEIL(M, block_tile * thread_tile));
-    kSgemmThreadTiled<block_tile, 32, thread_tile><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
+    kSgemmThreadTiled<block_tile, thread_tile><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
 
     CHECK(cudaGetLastError());
     CHECK(cudaDeviceSynchronize());
