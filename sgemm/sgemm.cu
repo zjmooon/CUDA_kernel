@@ -53,10 +53,7 @@ void iSgemmNaive(int M, int N, int K,
 }
 
 
-
-// Block-tiled kernel with shared memory
-// Row-major assumed. TILE_DIM should divide or handle boundaries.
-template <int TILE_DIM>
+/* template <int TILE_DIM>
 __global__ void kSgemmBlockTiled(int M, int N, int K,
                         const float* __restrict__ A, int lda,
                         const float* __restrict__ B, int ldb,
@@ -111,11 +108,11 @@ void iSgemmBlockTiled(int M, int N, int K,
 
     kSgemmBlockTiled<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
 }
-
+ */
 
 
 template <int TILE_DIM>
-__global__ void kSgemmBlockTiled2(int M, int N, int K,
+__global__ void kSgemmBlockTiled(int M, int N, int K,
                         const float* __restrict__ A, int lda,
                         const float* __restrict__ B, int ldb,
                         float* C, int ldc) 
@@ -160,7 +157,7 @@ __global__ void kSgemmBlockTiled2(int M, int N, int K,
     C = &C[ldc * TILE_DIM * blockIdx.y + TILE_DIM * blockIdx.x];
     C[ty * ldc + tx] = acc;   // 不是 C[gy * ldc + gx] = acc, 因为C首地址已经移动到局部了
 }
-void iSgemmBlockTiled2(int M, int N, int K,
+void iSgemmBlockTiled(int M, int N, int K,
                         const float* __restrict__ A, int lda,
                         const float* __restrict__ B, int ldb,
                         float* C, int ldc)
@@ -168,26 +165,102 @@ void iSgemmBlockTiled2(int M, int N, int K,
     dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
     dim3 gridSize(CEIL(N, BLOCK_SIZE), CEIL(M, BLOCK_SIZE));
 
-    kSgemmBlockTiled2<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
+    kSgemmBlockTiled<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
 
+/* 
+* 在block tile的基础上使用float4向量化优化。
+* Using vectorized loads reduces the total number of instructions, reduces latency, and improves bandwidth utilization.
+* 线程布局在block维度除以4。
+* https://developer.nvidia.com/blog/cuda-pro-tip-increase-performance-with-vectorized-memory-access/
+*/
+template <int TILE_DIM>
+__global__ void kSgemmBlockTiled_float4(int M, int N, int K,
+                        const float* __restrict__ A, int lda,
+                        const float* __restrict__ B, int ldb,
+                        float* C, int ldc) 
+{
+    const int gx = threadIdx.x + blockDim.x * blockIdx.x; 
+    const int gy = threadIdx.y + blockDim.y * blockIdx.y; 
 
+    if (4 * gx >= N || gy >= M) return;
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    __shared__ float As[TILE_DIM][TILE_DIM];
+    __shared__ float Bs[TILE_DIM][TILE_DIM];
+
+    A = &A[lda * TILE_DIM * blockIdx.y];
+    B = &B[TILE_DIM * blockIdx.x];
+    float4 acc4 = {0.0f, 0.0f, 0.0f, 0.0f};
+    // float4 a4, b4;
+    
+
+    # pragma unroll
+    for (int k = 0; k < K; k += TILE_DIM) {
+        reinterpret_cast<float4*>(&(As[ty][tx * 4]))[0] = reinterpret_cast<const float4*>(A + ty * lda)[tx];
+        reinterpret_cast<float4*>(&(Bs[ty][tx * 4]))[0] = reinterpret_cast<const float4*>(B + ty * ldb)[tx];
+        // 虽然tx因为线程布局的变动变为原来的1/4，但不要修改A,B相关的tx索引。因为A B是输入，需要保留原始索引做 float --> float4
+        /* a4 = reinterpret_cast<const float4*>(A + ty * lda)[tx]; // 不是(A)[ty * lda + tx]
+        As[ty][tx * 4    ] = a4.x;
+        As[ty][tx * 4 + 1] = a4.y;
+        As[ty][tx * 4 + 2] = a4.z;
+        As[ty][tx * 4 + 3] = a4.w;
+        b4 = reinterpret_cast<const float4*>(B + ty * ldb)[tx];
+        Bs[ty][tx * 4    ] = b4.x;
+        Bs[ty][tx * 4 + 1] = b4.y;
+        Bs[ty][tx * 4 + 2] = b4.z;
+        Bs[ty][tx * 4 + 3] = b4.w; */
+          
+        __syncthreads();
+
+        A += TILE_DIM;
+        B += TILE_DIM * ldb;
+
+        # pragma unroll
+        for (int k_inner = 0; k_inner < TILE_DIM; k_inner++) {
+            acc4.x += As[ty][k_inner] * Bs[k_inner][tx * 4    ];
+            acc4.y += As[ty][k_inner] * Bs[k_inner][tx * 4 + 1];
+            acc4.z += As[ty][k_inner] * Bs[k_inner][tx * 4 + 2];
+            acc4.w += As[ty][k_inner] * Bs[k_inner][tx * 4 + 3];
+        }
+        __syncthreads();
+    }
+
+    C = &C[ldc * TILE_DIM * blockIdx.y + TILE_DIM * blockIdx.x];
+    C[ty * ldc + tx * 4    ] = acc4.x;
+    C[ty * ldc + tx * 4 + 1] = acc4.y;
+    C[ty * ldc + tx * 4 + 2] = acc4.z;
+    C[ty * ldc + tx * 4 + 3] = acc4.w;
+}
+void iSgemmBlockTiled_float4(int M, int N, int K,
+                        const float* __restrict__ A, int lda,
+                        const float* __restrict__ B, int ldb,
+                        float* C, int ldc)
+{
+    dim3 blockSize(CEIL(BLOCK_SIZE, 4), BLOCK_SIZE); // (8, 32)，适应float4的线程布局
+    dim3 gridSize(CEIL(N, BLOCK_SIZE), CEIL(M, BLOCK_SIZE));
+
+    kSgemmBlockTiled_float4<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
+}
+
+
+/* 
+* thread tile版本与block tile版本相比，区别在于tt中一个线程会负责C中THREAD_TILE*THREAD_TILE个数据。计算访存比会更高，提高线程利用率
+* 所以需要更改的地方有： 
+* TILE_DIM ---> BLOCK_TILE * THREAD_TILE
+* 两层循环将数据搬运到shared memory和register memory
+* tx ---> tx + x * BLOCK_TILE 
+* ty ---> ty + y * BLOCK_TILE
+*/
 template <const int BLOCK_TILE, const int THREAD_TILE>
 __global__ void kSgemmThreadTiled(int M, int N, int K,
                         const float* __restrict__ A, int lda,
                         const float* __restrict__ B, int ldb,
                         float* C, int ldc)
 {
-    /* 
-    * thread tile版本与block tile版本相比，区别在于tt中一个线程会负责C中THREAD_TILE*THREAD_TILE个数据。计算访存比会更高，提高线程利用率
-    * 所以需要更改的地方有： 
-    * TILE_DIM ---> BLOCK_TILE * THREAD_TILE
-    * 两层循环将数据搬运到shared memory和register memory
-    * tx ---> tx + x * BLOCK_TILE 
-    * ty ---> ty + i * BLOCK_TILE
-    */
-
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
     constexpr int TILE_DIM = BLOCK_TILE * THREAD_TILE; // 数据布局
@@ -365,12 +438,12 @@ int main(int argc, char** argv)
     CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(hC, kernel_C, M * N, 1e-3);  
 
-    CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
+    /* CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{iSgemmBlockTiled2(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
     std::cout << GREEN << std::endl << "[device block tile (another version)]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(kernel_C, 0, sizeC * sizeof(float));
     CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
-    verifyResult(hC, kernel_C, M * N, 1e-3);  
+    verifyResult(hC, kernel_C, M * N, 1e-3); */  
 
     CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{iSgemmThreadTiled(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
@@ -379,6 +452,12 @@ int main(int argc, char** argv)
     CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(hC, kernel_C, M * N, 1e-3);  
 
+    CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
+    total_time = TIME_RECORD(repeat_times, ([&]{iSgemmBlockTiled_float4(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
+    std::cout << GREEN << std::endl << "[device block tile float4]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(kernel_C, 0, sizeC * sizeof(float));
+    CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(hC, kernel_C, M * N, 1e-3);  
 
     // cleanup
     cudaFree(dA); 
