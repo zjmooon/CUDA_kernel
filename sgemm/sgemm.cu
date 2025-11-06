@@ -324,7 +324,12 @@ void iSgemmThreadTiled(int M, int N, int K,
                         float* C, int ldc)
 {
     const int block_tile = 16;
-    const int thread_tile = 2; 
+    const int thread_tile = 4;
+    // 3060:每个线程块的shared memory最大值：48 KB
+    // 共享内存使用：As[64*64] + Bs[64*64] = 16KB + 16KB = 32KB < 48KB
+    // 4080S:每个线程块的shared memory最大值：99 KB
+    // 现在的核函数设计不能最大化利用shared memory，是一个性能优化点
+
     dim3 blockSize(block_tile, block_tile);
     dim3 gridSize(CEIL(N, block_tile * thread_tile), CEIL(M, block_tile * thread_tile));
     kSgemmThreadTiled<block_tile, thread_tile><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
