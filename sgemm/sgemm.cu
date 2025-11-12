@@ -338,7 +338,76 @@ void iSgemmThreadTiled(int M, int N, int K,
     CHECK(cudaDeviceSynchronize());
 }
 
+// 比较常见的thread tile版本
+template<const int BM,
+         const int BN,
+         const int BK,
+         const int TM,
+         const int TN>
+__global__ void kSgemmThreadTiled_ref(const float* __restrict__ A, const float* __restrict__ B,
+                        float* C, int M, int N, int K) {
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
 
+    int block_row_thread = BN / TN;  // block中一行的thread数量
+    int block_col_thread = BM / TM;  // block中一列的thread数量
+    int thread_num = block_row_thread * block_col_thread;  // block中thread总量
+
+    int tx = (threadIdx.x % block_row_thread) * TN;  // threadtile左上角x坐标
+    int ty = (threadIdx.x / block_row_thread) * TM;  // threadtile左上角y坐标
+
+    __shared__ float As[BM * BK];
+    __shared__ float Bs[BK * BN];
+
+    A = &A[by * BM * K];
+    B = &B[bx * BN];
+    C = &C[by * BM * N + bx * BN];
+
+    int a_tile_row = threadIdx.x / BK;
+    int a_tile_col = threadIdx.x % BK;
+    int a_tile_stride = thread_num / BK;  // BM/(BM/(thread_num/BK)) = thread_num/BK = stride
+
+    int b_tile_row = threadIdx.x / BN;
+    int b_tile_col = threadIdx.x % BN;
+    int b_tile_stride = thread_num / BN;
+
+    float accum[TM][TN] = {0.0f};
+    for (int k = 0; k < K; k += BK) {
+        for (int i = 0; i < BM; i += a_tile_stride) {
+            As[(a_tile_row + i) * BK + a_tile_col] = A[(a_tile_row + i) * K + a_tile_col];
+        }
+        for (int i = 0; i < BK; i += b_tile_stride) {
+            Bs[(b_tile_row + i) * BN + b_tile_col] = B[(b_tile_row + i) * N + b_tile_col];
+        }
+        __syncthreads();
+
+        A += BK;
+        B += BK * N;
+
+        for (int row = 0; row < TM; row++) {
+            for (int col = 0; col < TN; col++) {
+                for (int i = 0; i < BK; i++) {
+                    accum[row][col] += As[(ty + row) * BK + i] * Bs[i * BN + (tx + col)];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    for (int row = 0; row < TM; row++) {
+        for (int col = 0; col < TN; col++) {
+            C[(ty + row) * N + (tx + col)] = accum[row][col];
+        }
+    }
+}
+void iSgemmThreadTiled_ref(int M, int N, int K,
+                        const float* __restrict__ A, int lda,
+                        const float* __restrict__ B, int ldb,
+                        float* C, int ldc)
+{
+    dim3 block(256);
+    dim3 grid(CEIL(N,128), CEIL(M,128));
+    kSgemmThreadTiled_ref<128, 128, 8, 8, 8><<<grid, block>>>(A, B, C, M, N, K);
+}
 
 // initialize matrix
 void rand_matrix(float* mat, int rows, int cols, int ld) {
@@ -453,6 +522,13 @@ int main(int argc, char** argv)
     CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{iSgemmThreadTiled(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
     std::cout << GREEN << std::endl << "[device thread tile]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(kernel_C, 0, sizeC * sizeof(float));
+    CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(hC, kernel_C, M * N, 1e-3);  
+
+    CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
+    total_time = TIME_RECORD(repeat_times, ([&]{iSgemmThreadTiled_ref(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
+    std::cout << GREEN << std::endl << "[device thread tile reference]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(kernel_C, 0, sizeC * sizeof(float));
     CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(hC, kernel_C, M * N, 1e-3);  

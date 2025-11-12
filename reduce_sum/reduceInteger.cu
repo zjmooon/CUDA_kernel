@@ -208,6 +208,11 @@ __global__ void kReduceWarp(const int *src, int *dst, int N) {
     if (laneId == 0) s_data[warpId] = val; // 将数据搬运到共享内存以便后续block内归约
     __syncthreads();
 
+    /*
+    * 经过之前的步骤，现在的数据情况是， 
+    * 每个warp的结果已经归约到laneId == 0的线程上，并搬运到shared memory上    
+    */
+    // 1.每个block选择一个warp做shared memory归约
     if (warpId == 0) { // 在每个block的第一个warp内归约之前warp归约的结果
         int warpNum = blockDim.x / warpSize; 
         val = (laneId < warpNum) ? s_data[laneId] : 0; // 因为s_data可能没有全部用到，所以需要判断
@@ -218,6 +223,15 @@ __global__ void kReduceWarp(const int *src, int *dst, int N) {
         }
         if (laneId == 0) atomicAdd(dst, val); // 每个block选择第一个线程做atomicAdd(只能是laneId == 0)，将每个block的值加到dst
     }
+    
+    // 2.每个block选择一个线程将block内的多个warp归约的部分和做块内求和
+    /* if (threadIdx.x == 0) {
+        int warp_acc = 0;
+        for (int i = 0; i < 32; ++i) {
+            warp_acc += s_data[i];
+        }
+        atomicAdd(dst, warp_acc);
+    } */
 }
 void iReduceWarp(int *src, int *dst, unsigned int n, int *sum) {
     dim3 blockSize(256);
@@ -233,6 +247,7 @@ void iReduceWarp(int *src, int *dst, unsigned int n, int *sum) {
 
     std::cout << *sum << ", ";
 } 
+
 
 
 /* 
@@ -617,8 +632,8 @@ __global__ void  kReduceUnrollWarps8_shared(int *src, int *dst, unsigned int N)
     // warp-level reduction using shuffle
     if (tid < 32)
     {
-        #pragma unroll
         int val = sdata[tid];
+        #pragma unroll
         for (int stride = warpSize / 2; stride > 0; stride >>= 1) {
             val += __shfl_down_sync(0xffffffff, val, stride);
         }
@@ -763,61 +778,61 @@ int main(int argc, char **argv)
     iStart = seconds();
     int cpu_sum = recursiveReduce(cpu_src, size);
     iElaps = seconds() - iStart;
-    std::cout << RED << "[host]: elapsed = " << iElaps * 1000 << " ms, " << "sum = " << cpu_sum << RESET << std::endl << std::endl;
+    std::cout << GREEN << "[host]: elapsed = " << iElaps * 1000 << " ms, " << "sum = " << cpu_sum << RESET << std::endl << std::endl;
 
     // gpu neighbored
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceNeighbored(d_src, d_dst, size, sum);}));
-    std::cout << RED << std::endl << "[device neighbored]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl << std::endl;
+    std::cout << GREEN << std::endl << "[device neighbored]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl << std::endl;
 
     // gpu Interleaved
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceInterleaved(d_src, d_dst, size, sum);}));
-    std::cout << RED << std::endl << "[device interleaved]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
+    std::cout << GREEN << std::endl << "[device interleaved]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
 
     // gpu warp
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceWarp(d_src, d_dst, size, sum);}));
-    std::cout << RED << std::endl << "[device warp]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
+    std::cout << GREEN << std::endl << "[device warp]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
 
     // gpu warp vectorization
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceWarpVec4(d_src, d_dst, size, sum);}));
-    std::cout << RED << std::endl << "[device warp vectorization4]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
+    std::cout << GREEN << std::endl << "[device warp vectorization4]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
     // gpu warp vectorization
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceWarpVec4_v2(d_src, d_dst, size, sum);}));
-    std::cout << RED << std::endl << "[device warp vectorization4_v2]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
+    std::cout << GREEN << std::endl << "[device warp vectorization4_v2]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
 
     // gpu Interleaved_shared
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceInterleaved_shared(d_src, d_dst, size, sum);}));
-    std::cout << RED << std::endl << "[device Interleaved_shared]: elapsed = " << total_time / repeat_times << RESET << " ms" << std::endl << std::endl; 
+    std::cout << GREEN << std::endl << "[device Interleaved_shared]: elapsed = " << total_time / repeat_times << RESET << " ms" << std::endl << std::endl; 
 
     // gpu Interleaved_shared_unrolling4
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceInterleavedUnrolling4(d_src, d_dst, size, sum);}));
-    std::cout << RED << std::endl << "[device Interleaved_shared_unrolling4]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
+    std::cout << GREEN << std::endl << "[device Interleaved_shared_unrolling4]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
 
     // gpu Interleaved_unrolling8
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceInterleavedUnrolling8(d_src, d_dst, size, sum);}));
-    std::cout << RED << std::endl << "[device Interleaved_unrolling8]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
+    std::cout << GREEN << std::endl << "[device Interleaved_unrolling8]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
 
     // gpu Interleaved_unrolling8
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceUnrollWarps8(d_src, d_dst, size, sum);}));
-    std::cout << RED << std::endl << "[device Unroll8_warp]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
+    std::cout << GREEN << std::endl << "[device Unroll8_warp]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
 
     // gpu Interleaved_unrolling8_ shared
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceUnrollWarps8_shared(d_src, d_dst, size, sum);}));
-    std::cout << RED << std::endl << "[device Unroll8_warp_shared]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
+    std::cout << GREEN << std::endl << "[device Unroll8_warp_shared]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
 
     // gpu Interleaved_Complete_Unroll
     cudaMemcpy(d_src, h_src, bytes, cudaMemcpyHostToDevice);
     total_time = TIME_RECORD(repeat_times, ([&]{iReduceCompleteUnroll(d_src, d_dst, size, sum);}));
-    std::cout << RED << std::endl << "[device Complete Unroll]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
+    std::cout << GREEN << std::endl << "[device Complete Unroll]: elapsed = " << total_time / repeat_times << " ms" << RESET << std::endl << std::endl; 
 
     free(h_src);
     free(cpu_src);
