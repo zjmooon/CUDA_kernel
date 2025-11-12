@@ -198,12 +198,17 @@ __global__ void kReduceWarp(const int *src, int *dst, int N) {
     #pragma unroll
     for (int stride = warpSize / 2; stride > 0; stride >>= 1) {
         val += __shfl_down_sync(0xffffffff, val, stride); // 将一个warp内的值归约到一个thread(laneId==0)中
-    }
+    } 
+    /*
+    * 归约中使用for循环做规约，虽然block中的所有线程都会执行执行这个循环，但只有一个thread得到最终结果(一般设计为threadIdx.x == 0),
+    * 其他线程只会得到某个阶段的结果。
+    * 同理，warp中的32个线程会执行相同的指令(SIMT)，但只有一个thread得到最终结果(一般为 threadIdx.x % warpSize == 0)。
+    */
 
     if (laneId == 0) s_data[warpId] = val; // 将数据搬运到共享内存以便后续block内归约
     __syncthreads();
 
-    if (warpId == 0) { // 在一个block内归约之前warp归约的结果
+    if (warpId == 0) { // 在每个block的第一个warp内归约之前warp归约的结果
         int warpNum = blockDim.x / warpSize; 
         val = (laneId < warpNum) ? s_data[laneId] : 0; // 因为s_data可能没有全部用到，所以需要判断
 
@@ -211,7 +216,7 @@ __global__ void kReduceWarp(const int *src, int *dst, int N) {
         for (int stride = warpSize / 2; stride > 0; stride >>= 1) {
             val += __shfl_down_sync(0xffffffff, val, stride);
         }
-        if (laneId == 0) atomicAdd(dst, val); // 一个block选择一个线程做atomicAdd，将全部block的值加到dst
+        if (laneId == 0) atomicAdd(dst, val); // 每个block选择第一个线程做atomicAdd(只能是laneId == 0)，将每个block的值加到dst
     }
 }
 void iReduceWarp(int *src, int *dst, unsigned int n, int *sum) {
