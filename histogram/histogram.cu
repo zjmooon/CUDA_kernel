@@ -153,7 +153,7 @@ int main(int argc, char** argv)
     }
     
     if (isLocalImg) {
-        std::string image_path = "../moon_3840_2160.jpg";
+        std::string image_path = "./moon_3840_2160.jpg";
         localImg = cv::imread(image_path, cv::IMREAD_GRAYSCALE);
     }
 
