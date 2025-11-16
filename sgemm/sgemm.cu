@@ -480,7 +480,7 @@ int main(int argc, char** argv)
     // rand_matrix(hC, M, N, ldc); 
 
 
-    // allocate deveice memory
+    // allocate device memory
     float *dA, *dB, *dC;
     CHECK(cudaMalloc(reinterpret_cast<void **>(&dA), sizeA * sizeof(float)));
     CHECK(cudaMalloc(reinterpret_cast<void **>(&dB), sizeB * sizeof(float)));

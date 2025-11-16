@@ -1,4 +1,5 @@
 #include <sys/time.h>
+#include <opencv2/opencv.hpp>
 
 #ifndef _COMMON_H
 #define _COMMON_H
@@ -52,5 +53,15 @@ inline double seconds()
 #define RED         "\033[31m"
 #define GREEN       "\033[32m"
 #define YELLOW      "\033[33m"
+
+namespace imageIO
+{
+    void saveBgrUint8(unsigned char* src, int height, int width, std::string fileName) {
+        // cv::Mat image(cv::Size(width, height), CV_8UC3, src);
+        cv::Mat resize_img(height, width, CV_8UC3, src);
+        cv::imwrite(fileName, resize_img);
+    }
+}
+
 
 #endif // _COMMON_H
