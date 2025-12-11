@@ -351,12 +351,13 @@ __global__ void kSgemmThreadTiled_ref(const float* __restrict__ A, const float* 
     int by = blockIdx.y;
 
     // 因为此核函数的线程布局blockSize是一维的，所以需要手动计算 threadIdx.x,threadIdx.y
-    int block_row_thread = BN / TN;  // block中一行的thread数量 
-    int block_col_thread = BM / TM;  // block中一列的thread数量
+    int block_row_thread = BN / TN;  // block中一行的thread数量 (128/8=16)
+    int block_col_thread = BM / TM;  // block中一列的thread数量 (128/8=16)
     int thread_num = block_row_thread * block_col_thread;  // block中thread总量  ?blockDim.x
 
-    int tx = (threadIdx.x % block_row_thread) * TN;  // threadtile左上角x坐标 (threadTile操作(线程操作更多数据)，加倍Mul, 后续时+(0, Mul-1))
-    int ty = (threadIdx.x / block_row_thread) * TM;  // threadtile左上角y坐标
+    // (threadTile操作(线程操作更多数据)，加倍Mul, 后续时填充+(0~Mul-1))
+    int tx = (threadIdx.x % block_row_thread) * TN;  // threadtile左上角x坐标 ((0~255) % 16) * 8 --> (0~15) * 8 --> (0,8,16,...,120)  
+    int ty = (threadIdx.x / block_row_thread) * TM;  // threadtile左上角y坐标 ((0~255) / 16) * 8 --> (0~15) * 8 --> (0,8,16,...,120)  
 
     __shared__ float As[BM][BK];
     __shared__ float Bs[BK][BN];
@@ -392,7 +393,12 @@ __global__ void kSgemmThreadTiled_ref(const float* __restrict__ A, const float* 
         for (int row = 0; row < TM; row++) {
             for (int col = 0; col < TN; col++) {
                 for (int i = 0; i < BK; i++) {
-                    accum[row][col] += As[ty + row][i] * Bs[i][tx + col)];
+                    // tx,ty:(0,8,16,...,120)
+                    // row,col:(0~7)
+                    // 对于线程[ty，tx]，它计算C中TM*TN个数据
+                    // 对于As、Bs, 每一个数据的计算需要As的一行与Bs的一列(A一行的部分和B一列的部分)
+                    // 计算一个accum[row][col]要访问As、Bs各TM*TN次，可以搬运shared memory数据到register memory中提高访问速度
+                    accum[row][col] += As[ty + row][i] * Bs[i][tx + col];
                 }
             }
         }
