@@ -266,7 +266,7 @@ __global__ void kSgemmThreadTiled(int M, int N, int K,
     constexpr int TILE_DIM = BLOCK_TILE * THREAD_TILE; // 数据布局
     
     __shared__ float As[TILE_DIM][TILE_DIM]; // BLOCK_TILE*BLOCK_TILE --> BLOCK_TILE*THREAD_TILE*BLOCK_TILE*THREAD_TILE
-    __shared__ float Bs[TILE_DIM][TILE_DIM]; // 因为线程布局不在与数据布局相同，一个线程现在要处理THREAD_TILE*THREAD_TILE倍数据
+    __shared__ float Bs[TILE_DIM][TILE_DIM]; // 因为线程布局不再与数据布局相同，一个线程现在要处理THREAD_TILE*THREAD_TILE倍数据
 
     A = &A[blockIdx.y * TILE_DIM * lda]; 
     B = &B[blockIdx.x * TILE_DIM];       
@@ -275,7 +275,8 @@ __global__ void kSgemmThreadTiled(int M, int N, int K,
     #pragma unroll
     for (int k = 0; k < K; k += TILE_DIM) 
     {
-        // 从global memory加载A到shared memory
+        // 从global memory搬运到shared memory
+        // 每个线程搬运THREAD_TILE*THREAD_TILE个数据，这些数据间隔为BLOCK_TILE(x,y方向都满足)
         #pragma unroll
         for (int i = 0; i < THREAD_TILE; i++) 
         {
@@ -349,35 +350,39 @@ __global__ void kSgemmThreadTiled_ref(const float* __restrict__ A, const float* 
     int bx = blockIdx.x;
     int by = blockIdx.y;
 
-    int block_row_thread = BN / TN;  // block中一行的thread数量
+    // 因为此核函数的线程布局blockSize是一维的，所以需要手动计算 threadIdx.x,threadIdx.y
+    int block_row_thread = BN / TN;  // block中一行的thread数量 
     int block_col_thread = BM / TM;  // block中一列的thread数量
-    int thread_num = block_row_thread * block_col_thread;  // block中thread总量
+    int thread_num = block_row_thread * block_col_thread;  // block中thread总量  ?blockDim.x
 
-    int tx = (threadIdx.x % block_row_thread) * TN;  // threadtile左上角x坐标
+    int tx = (threadIdx.x % block_row_thread) * TN;  // threadtile左上角x坐标 (threadTile操作(线程操作更多数据)，加倍Mul, 后续时+(0, Mul-1))
     int ty = (threadIdx.x / block_row_thread) * TM;  // threadtile左上角y坐标
 
-    __shared__ float As[BM * BK];
-    __shared__ float Bs[BK * BN];
+    __shared__ float As[BM][BK];
+    __shared__ float Bs[BK][BN];
 
     A = &A[by * BM * K];
     B = &B[bx * BN];
     C = &C[by * BM * N + bx * BN];
 
+    // 从global memory搬运到shared memory
+    // 可以不利用threadTile操作，所以设计成一个线程搬运少数数据：BM/a_tile_stride(与TM*TN比较)
     int a_tile_row = threadIdx.x / BK;
     int a_tile_col = threadIdx.x % BK;
-    int a_tile_stride = thread_num / BK;  // BM/(BM/(thread_num/BK)) = thread_num/BK = stride
-
+    int a_tile_stride = thread_num / BK; 
     int b_tile_row = threadIdx.x / BN;
     int b_tile_col = threadIdx.x % BN;
     int b_tile_stride = thread_num / BN;
 
     float accum[TM][TN] = {0.0f};
     for (int k = 0; k < K; k += BK) {
+        // 从global memory搬运到shared memory
+        // 每个线程搬运 BM/a_tile_stride个数据，这些数据间隔为a_tile_stride
         for (int i = 0; i < BM; i += a_tile_stride) {
-            As[(a_tile_row + i) * BK + a_tile_col] = A[(a_tile_row + i) * K + a_tile_col];
+            As[a_tile_row + i][a_tile_col] = A[(a_tile_row + i) * K + a_tile_col];
         }
         for (int i = 0; i < BK; i += b_tile_stride) {
-            Bs[(b_tile_row + i) * BN + b_tile_col] = B[(b_tile_row + i) * N + b_tile_col];
+            Bs[b_tile_row + i][b_tile_col] = B[(b_tile_row + i) * N + b_tile_col];
         }
         __syncthreads();
 
@@ -387,7 +392,7 @@ __global__ void kSgemmThreadTiled_ref(const float* __restrict__ A, const float* 
         for (int row = 0; row < TM; row++) {
             for (int col = 0; col < TN; col++) {
                 for (int i = 0; i < BK; i++) {
-                    accum[row][col] += As[(ty + row) * BK + i] * Bs[i * BN + (tx + col)];
+                    accum[row][col] += As[ty + row][i] * Bs[i][tx + col)];
                 }
             }
         }
