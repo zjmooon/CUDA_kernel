@@ -215,7 +215,7 @@ __global__ void kReduceWarp(const int *src, int *dst, int N) {
     // 1.每个block选择一个warp做shared memory归约
     if (warpId == 0) { // 在每个block的第一个warp内归约之前warp归约的结果
         int warpNum = blockDim.x / warpSize; 
-        val = (laneId < warpNum) ? s_data[laneId] : 0; // 因为s_data可能没有全部用到，所以需要判断
+        val = (laneId < warpNum) ? s_data[laneId] : 0;
 
         #pragma unroll
         for (int stride = warpSize / 2; stride > 0; stride >>= 1) {
