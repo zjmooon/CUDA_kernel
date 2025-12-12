@@ -339,7 +339,7 @@ void iSgemmThreadTiled(int M, int N, int K,
 }
 
 // 比较常见的thread tile版本
-// BM BN BK TM tN都属于数据布局的变量
+// BM BN BK TM TN都属于数据布局的变量
 template<const int BM,
          const int BN,
          const int BK,
@@ -382,6 +382,8 @@ __global__ void kSgemmThreadTiled_ref(const float* __restrict__ A, const float* 
     int b_tile_stride = thread_num / BN; // threadIdx.x,thread_num是线程布局变量，BN是数据布局变量
 
     float accum[TM][TN] = {0.0f};
+    float a_frag[TM] = {0.0f};
+    float b_frag[TN] = {0.0f};
     for (int k = 0; k < K; k += BK) {
         // 从global memory搬运到shared memory
         // 每个线程搬运 BM/a_tile_stride个数据，这些数据间隔为a_tile_stride
@@ -396,7 +398,7 @@ __global__ void kSgemmThreadTiled_ref(const float* __restrict__ A, const float* 
         A += BK;
         B += BK * N;
 
-        for (int row = 0; row < TM; row++) {
+        /* for (int row = 0; row < TM; row++) {
             for (int col = 0; col < TN; col++) {
                 for (int i = 0; i < BK; i++) {
                     // tx,ty:(0,8,16,...,120)
@@ -407,8 +409,26 @@ __global__ void kSgemmThreadTiled_ref(const float* __restrict__ A, const float* 
                     accum[row][col] += As[ty + row][i] * Bs[i][tx + col];
                 }
             }
+        } */
+
+        for (int i = 0; i < Bk; i++) {
+            // 搬运shared memory数据到register memory中提高访问速度
+            // As的一列的TM个数据 As[[BM][BK]
+            // BM%TM==0
+            for (int j = 0; j < TM; j++) {
+                a_frag[j] = As[ty + j][i];
+            }
+            // Bs的一行的TN个数据 Bs[BK][BN]
+            for (int l = 0; l < TN; l++) {
+                b_frag[l] = Bs[i][tx + l];
+            }
+            for (int j = 0; j < TM; j++) {
+                for (int l = 0; l < TN; l++)
+                    tmp[j][l] += a_frag[j] * b_frag[l];
+            }
+    
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     for (int row = 0; row < TM; row++) {
