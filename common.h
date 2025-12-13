@@ -4,6 +4,9 @@
 #ifndef _COMMON_H
 #define _COMMON_H
 
+#define OFFSET(row, col, ld) ((row)*(ld)+(col))
+#define FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
+
 // 向上取整
 #define CEIL(x, y) (((x) + (y) - 1) / (y))
 
