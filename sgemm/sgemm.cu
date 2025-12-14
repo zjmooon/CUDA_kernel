@@ -620,21 +620,17 @@ __global__ void kSgemmThreadTiled_float4_noTranspose(const float* __restrict__ A
         B += BK * N;
 
         
-        // 外积，效率好。访问TM+TN次shared_memory 
+        // 外积，效率好。访问shared_memory TM+TN次 
         #pragma unroll
         for (int k_inner = 0; k_inner < BK; k_inner++) {
             // 搬运shared memory数据到register memory中提高访问速度
             // As的一列的TM个数据 As[BM][BK]
-
-            /* // 不能这样使用float4，传进的pointer需要是最外层
+            // 因为A-->As仍以[BM][BK]排列,所以一个线程取As的一列TM个float。
+            // 又因为要取的数据不是行主序，所以不能如Bs-->b_frag一样使用FLOAT4,只能element-wise取
             #pragma unroll
-            for (int y = 0; y < TM; y += 4) {
-                FLOAT4(a_frag[y]) = FLOAT4(As[ty + y][k_inner]);
-            } */
-            
-
-
-
+            for (int y = 0; y < TM; y++) {
+                a_frag[y] = As[ty + y][k_inner];
+            }
             // Bs的一行的TN个数据 Bs[BK][BN]
             #pragma unroll
             for (int x = 0; x < TN; x += 4) {
@@ -649,7 +645,7 @@ __global__ void kSgemmThreadTiled_float4_noTranspose(const float* __restrict__ A
             }    
         }
 
-        /* // 内积，效率比较低。访问TM*TN*2次shared_memory
+        /* // 内积，效率比较低。访问shared_memoryTM*TN*2次
         #pragma unroll
         for (int k_inner = 0; k_inner < BK; k_inner++) {
             #pragma unroll
