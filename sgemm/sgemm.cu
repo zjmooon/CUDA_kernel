@@ -664,12 +664,7 @@ __global__ void kSgemmThreadTiled_float4_noTranspose(const float* __restrict__ A
     for (int y = 0; y < TM; y++) {
         #pragma unroll
         for (int x = 0; x < TN; x += 4) {
-            float4 c_tmp = FLOAT4(C[(ty + y) * N + (tx + x)]);
-            c_tmp.x = accum[y][x   ];
-            c_tmp.y = accum[y][x + 1];
-            c_tmp.z = accum[y][x + 2];
-            c_tmp.w = accum[y][x + 3];
-            FLOAT4(C[(ty + y) * N + (tx + x)]) = c_tmp;
+            FLOAT4(C[(ty + y) * N + (tx + x)]) = FLOAT4(C[(ty + y) * N + (tx + x)]);
         }
     }
 }
@@ -789,12 +784,7 @@ __global__ void kSgemmThreadTiled_float4(const float* __restrict__ A, const floa
     for (int m = 0; m < TM; m++) {
         #pragma unroll
         for (int n = 0; n < TN; n += 4) {
-            float4 ctmp = FLOAT4(C[(ty + m) * N + tx + n]);
-            ctmp.x = accum[m][n    ];
-            ctmp.y = accum[m][n + 1];
-            ctmp.z = accum[m][n + 2];
-            ctmp.w = accum[m][n + 3];
-            FLOAT4(C[(ty + m) * N + tx + n]) = ctmp;
+            FLOAT4(C[(ty + m) * N + tx + n]) = FLOAT4(C[(ty + m) * N + tx + n]);
         }
     }
 }
