@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "CUDA Debug (With OpenCV)",
+            "type": "cuda-gdb",       // 改为 CUDA 专用调试器
+            "request": "launch",
+            "program": "${fileDirname}/${fileBasenameNoExtension}",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${fileDirname}",
+            "environment": [],
+            "preLaunchTask": "CUDA and OpenCV Build" // 必须与 tasks.json 的 label 一致
+        }
+    ]
+}

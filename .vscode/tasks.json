@@ -1,0 +1,34 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "shell",
+            "label": "CUDA and OpenCV Build", // 任务名称，必须与 launch.json 匹配
+            "command": "/usr/local/cuda/bin/nvcc",
+            "args": [
+                "-g",                // CPU 调试信息
+                "-G",                // GPU 调试信息（开启后可调试 Kernel 内部）
+                "${file}",           // 当前打开的 .cu 文件
+                "-o",
+                "${fileDirname}/${fileBasenameNoExtension}",
+                "-I/usr/local/include/opencv4", // OpenCV 头文件路径
+                "-lopencv_core",          // 链接 OpenCV 核心库
+                "-lopencv_highgui",       // 链接 UI 库
+                "-lopencv_imgcodecs",     // 链接 图像读写 库
+                "-lopencv_imgproc",       // 链接 图像处理 库
+                "-Wno-deprecated-gpu-targets" // 忽略旧架构警告
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "使用 nvcc 编译带有 OpenCV 的 CUDA 程序"
+        }
+    ]
+}
