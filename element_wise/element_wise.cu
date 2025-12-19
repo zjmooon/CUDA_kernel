@@ -14,6 +14,7 @@ __global__ void kVectorAdd_Naive(const float* __restrict__ A, const float* __res
 }
 void iVectorAdd_Naive(const float* A, const float* B, float* C, int N) 
 {
+    // 线程布局：每个线程处理一个数据(float)
     int blockSize = 512;
     int gridSize = CEIL(N, blockSize); 
 
@@ -37,8 +38,8 @@ void iVectorAdd_GridStride(const float* A, const float* B, float* C, int N)
 {
     int blockSize = 512;
     // Grid Size Calculation (针对 Grid-Stride Loop 的优化)
-    // 不需要 (N + blockSize - 1) / blockSize 这么大的 Grid
-    // 只需要生成足够填满 GPU 所有 SM 的线程即可。
+    // 不需要 (N + blockSize - 1) / blockSize 这么大的 Grid，通过(int i = g_id; i < N; i += stride)会自动分配
+    // 只需要生成足够填满 GPU 所有 SM 的线程即可
     // 这里的逻辑是：获取 SM 数量，每个 SM 跑 32 个 Block (经验值，保证占有率)
     int numSMs;
     int dev;
@@ -64,7 +65,7 @@ __global__ void kVectorAdd_gridStride_Float4(const float* __restrict__ A, const 
 
     int g_id = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
-    // 使用float4，一个线程处理4个数据
+    // 使用float4，以4个数据为单位/迭代
     const int f4_N = N / 4;
 
     for (int i = g_id; i < f4_N; i += stride) 
