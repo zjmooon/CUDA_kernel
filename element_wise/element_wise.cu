@@ -34,10 +34,14 @@ __global__ void kVectorAdd_Float4(const float* __restrict__ A, const float* __re
     const float4* float4_B = reinterpret_cast<const float4*>(B);
     float4* float4_C = reinterpret_cast<float4*>(C);
 
-    float4_C[g_id] = make_float4(   (float4_A[g_id].x + float4_B[g_id].x),
-                                    (float4_A[g_id].y + float4_B[g_id].y),
-                                    (float4_A[g_id].z + float4_B[g_id].z),
-                                    (float4_A[g_id].w + float4_B[g_id].w)    );
+    float4 float4_A_tmp = float4_A[g_id];
+    float4 float4_B_tmp = float4_B[g_id];
+
+
+    float4_C[g_id] = make_float4(   (float4_A_tmp.x + float4_B_tmp.x),
+                                    (float4_A_tmp.y + float4_B_tmp.y),
+                                    (float4_A_tmp.z + float4_B_tmp.z),
+                                    (float4_A_tmp.w + float4_B_tmp.w)    );
 
 }
 void iVectorAdd_Float4(const float* A, const float* B, float* C, int N) 
