@@ -24,6 +24,33 @@ void iVectorAdd_Naive(const float* A, const float* B, float* C, int N)
 
 
 
+__global__ void kVectorAdd_Float4(const float* __restrict__ A, const float* __restrict__ B, 
+    float* __restrict__ C, int N) 
+{
+    int g_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g_id * 4 >= N) return;
+
+    const float4* float4_A = reinterpret_cast<const float4*>(A);
+    const float4* float4_B = reinterpret_cast<const float4*>(B);
+    float4* float4_C = reinterpret_cast<float4*>(C);
+
+    float4_C[g_id] = make_float4(   (float4_A[g_id].x + float4_B[g_id].x),
+                                    (float4_A[g_id].y + float4_B[g_id].y),
+                                    (float4_A[g_id].z + float4_B[g_id].z),
+                                    (float4_A[g_id].w + float4_B[g_id].w)    );
+
+}
+void iVectorAdd_Float4(const float* A, const float* B, float* C, int N) 
+{
+    int blockSize = 512;
+    int gridSize = CEIL(CEIL(N, 4), blockSize); 
+
+    kVectorAdd_Float4<<<gridSize, blockSize>>>(A, B, C, N);
+    CHECK(cudaDeviceSynchronize());
+}
+
+
+
 __global__ void kVectorAdd_GridStride(const float* __restrict__ A, const float* __restrict__ B, 
     float* __restrict__ C, int N) 
 {
@@ -165,6 +192,16 @@ int main(int argc, char **argv) {
     memset(h_C, 0, nBytes);
     CHECK(cudaMemcpy(h_C, d_C, nBytes, cudaMemcpyDeviceToHost));
     verifyResult(h_Ref, h_C, n);  
+
+    // gpu naive
+    CHECK(cudaMemset(d_C, 0, nBytes));
+    total_time = TIME_RECORD(repeat_times, ([&]{iVectorAdd_Float4(d_A, d_B, d_C, n);}));
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
+    " [device float4]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(h_C, 0, nBytes);
+    CHECK(cudaMemcpy(h_C, d_C, nBytes, cudaMemcpyDeviceToHost));
+    verifyResult(h_Ref, h_C, n);  
+
 
     // gpu gride stride
     CHECK(cudaMemset(d_C, 0, nBytes));
