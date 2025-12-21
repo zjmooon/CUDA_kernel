@@ -381,8 +381,8 @@ __global__ void kSgemmThreadTiled_ref(const float* __restrict__ A, const float* 
     int b_tile_stride = thread_num / BN; // threadIdx.x,thread_num是线程布局变量，BN是数据布局变量
 
     float accum[TM][TN] = {0.0f};
-    float a_frag[TM] = {0.0f};
-    float b_frag[TN] = {0.0f};
+    float a_reg[TM] = {0.0f};
+    float b_reg[TN] = {0.0f};
     
     #pragma unroll
     for (int k = 0; k < K; k += BK) {
@@ -427,18 +427,18 @@ __global__ void kSgemmThreadTiled_ref(const float* __restrict__ A, const float* 
             // BM%TM==0
             #pragma unroll
             for (int y = 0; y < TM; y++) {
-                a_frag[y] = As[ty + y][k_inner];
+                a_reg[y] = As[ty + y][k_inner];
             }
             // Bs的一行的TN个数据 Bs[BK][BN]
             #pragma unroll
             for (int x = 0; x < TN; x++) {
-                b_frag[x] = Bs[k_inner][tx + x];
+                b_reg[x] = Bs[k_inner][tx + x];
             }
             #pragma unroll
             for (int y = 0; y < TM; y++) {
                 #pragma unroll
                 for (int x = 0; x < TN; x++)
-                    accum[y][x] += a_frag[y] * b_frag[x];
+                    accum[y][x] += a_reg[y] * b_reg[x];
             }
         }
        
@@ -596,8 +596,8 @@ __global__ void kSgemmThreadTiled_float4_noTranspose(const float* __restrict__ A
     // int b_tile_stride = thread_num / BN; // threadIdx.x,thread_num是线程布局变量，BN是数据布局变量
 
     float accum[TM][TN] = {0.0f};
-    float a_frag[TM] = {0.0f};
-    float b_frag[TN] = {0.0f};
+    float a_reg[TM] = {0.0f};
+    float b_reg[TN] = {0.0f};
 
     A = &A[by * BM * K];
     B = &B[bx * BN];
@@ -629,18 +629,18 @@ __global__ void kSgemmThreadTiled_float4_noTranspose(const float* __restrict__ A
             // 又因为要取的数据不是行主序，所以不能如Bs-->b_frag一样使用FLOAT4,只能element-wise取
             #pragma unroll
             for (int y = 0; y < TM; y++) {
-                a_frag[y] = As[ty + y][k_inner];
+                a_reg[y] = As[ty + y][k_inner];
             }
             // Bs的一行的TN个数据 Bs[BK][BN]
             #pragma unroll
             for (int x = 0; x < TN; x += 4) {
-                FLOAT4(b_frag[x]) = FLOAT4(Bs[k_inner][tx + x]);
+                FLOAT4(b_reg[x]) = FLOAT4(Bs[k_inner][tx + x]);
             }
             #pragma unroll
             for (int y = 0; y < TM; y++) {
                 #pragma unroll
                 for (int x = 0; x < TN; x++) {
-                    accum[y][x] += a_frag[y] * b_frag[x];
+                    accum[y][x] += a_reg[y] * b_reg[x];
                 }
             }    
         }
@@ -664,7 +664,7 @@ __global__ void kSgemmThreadTiled_float4_noTranspose(const float* __restrict__ A
     for (int y = 0; y < TM; y++) {
         #pragma unroll
         for (int x = 0; x < TN; x += 4) {
-            FLOAT4(C[(ty + y) * N + (tx + x)]) = FLOAT4(C[(ty + y) * N + (tx + x)]);
+            FLOAT4(C[(ty + y) * N + (tx + x)]) = FLOAT4(accum[y][x]);
         }
     }
 }
@@ -726,10 +726,10 @@ __global__ void kSgemmThreadTiled_float4(const float* __restrict__ A, const floa
     float accum[TM][TN] = {0.0f}; // 每个线程负责TM*TN个元素，则需要申请TM*TN个寄存器保存累加值
 
     // 
-    float ldg_a_reg[4 * ldg_a_num] = {0.0f}; // 每个线程搬运ldg_a_num轮，寄存器缓存ldg_a_num个float4元素，用于转置As矩阵
+    float a_stash_reg[4 * ldg_a_num] = {0.0f}; // 每个线程搬运ldg_a_num轮，寄存器缓存ldg_a_num个float4元素，用于转置As矩阵
 
-    float a_frag[TM] = {0.0f};
-    float b_frag[TN] = {0.0f};
+    float a_reg[TM] = {0.0f};
+    float b_reg[TN] = {0.0f};
 
     // 移动到当前block
     A = &A[by * BM * K];
@@ -741,14 +741,14 @@ __global__ void kSgemmThreadTiled_float4(const float* __restrict__ A, const floa
         #pragma unroll
         for (int i = 0; i < BM; i += a_tile_stride) {
             int ldg_index = i / a_tile_stride * 4;  // i/a_tile_stride就是循环次数(1,2,...,ldg_a_num)，4Mul用于取数
-            FLOAT4(ldg_a_reg[ldg_index]) = reinterpret_cast<const float4*>(&A[(a_tile_y + i) * K + a_tile_x])[0]; // A-->A_register float4为单位
+            FLOAT4(a_stash_reg[ldg_index]) = reinterpret_cast<const float4*>(&A[(a_tile_y + i) * K + a_tile_x])[0]; // A-->A_register float4为单位
             // As转置存，其中ldg_a_reg做中间缓存，目的是读取时可以按FLOAT4读取
             // 以行主序读A,以行主序写ldg_a_reg,再以列主序写As，实现转置
             // A_register-->As  float为单位
-            As[(a_tile_x    ) * BM + a_tile_y + i] = ldg_a_reg[ldg_index    ]; // 这里是BM不是BN,因为已经转置了
-            As[(a_tile_x + 1) * BM + a_tile_y + i] = ldg_a_reg[ldg_index + 1];
-            As[(a_tile_x + 2) * BM + a_tile_y + i] = ldg_a_reg[ldg_index + 2];
-            As[(a_tile_x + 3) * BM + a_tile_y + i] = ldg_a_reg[ldg_index + 3];
+            As[(a_tile_x    ) * BM + a_tile_y + i] = a_stash_reg[ldg_index    ]; // 这里是BM不是BN,因为已经转置了
+            As[(a_tile_x + 1) * BM + a_tile_y + i] = a_stash_reg[ldg_index + 1];
+            As[(a_tile_x + 2) * BM + a_tile_y + i] = a_stash_reg[ldg_index + 2];
+            As[(a_tile_x + 3) * BM + a_tile_y + i] = a_stash_reg[ldg_index + 3];
         }
         #pragma unroll
         for (int i = 0; i < BK; i += b_tile_stride) {
@@ -763,17 +763,17 @@ __global__ void kSgemmThreadTiled_float4(const float* __restrict__ A, const floa
         for (int k_inner = 0; k_inner < BK; k_inner++) {
             #pragma unroll
             for (int m = 0; m < TM; m += 4) {
-                FLOAT4(a_frag[m]) = FLOAT4(As[k_inner * BM + ty + m]);
+                FLOAT4(a_reg[m]) = FLOAT4(As[k_inner * BM + ty + m]);
             }
             #pragma unroll
             for (int n = 0; n < TN; n += 4) {
-                FLOAT4(b_frag[n]) = FLOAT4(Bs[k_inner * BN + tx + n]);
+                FLOAT4(b_reg[n]) = FLOAT4(Bs[k_inner * BN + tx + n]);
             }
             #pragma unroll
             for (int m = 0; m < TM; m++) {
                 #pragma unroll
                 for (int n = 0; n < TN; n++) {
-                    accum[m][n] += a_frag[m] * b_frag[n];
+                    accum[m][n] += a_reg[m] * b_reg[n];
                 }
             }
         }
@@ -784,7 +784,7 @@ __global__ void kSgemmThreadTiled_float4(const float* __restrict__ A, const floa
     for (int m = 0; m < TM; m++) {
         #pragma unroll
         for (int n = 0; n < TN; n += 4) {
-            FLOAT4(C[(ty + m) * N + tx + n]) = FLOAT4(C[(ty + m) * N + tx + n]);
+            FLOAT4(C[(ty + m) * N + (tx + n)]) = FLOAT4(accum[m][n]); // 使用FLOAT4(accum[m * TN + n])会有问题 
         }
     }
 }
@@ -799,6 +799,201 @@ void iSgemmThreadTiled_float4(int M, int N, int K,
     kSgemmThreadTiled_float4<128, 128, 8, 8, 8><<<grid, block>>>(A, B, C, M, N, K);
 }
 
+
+template<const int BM,
+         const int BN,
+         const int BK,
+         const int TM,
+         const int TN>
+__global__ void kSgemmThreadTiled_float4_doubleBuffer(const float* __restrict__ A, const float* __restrict__ B,
+                        float* C, int M, int N, int K)  {
+
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+
+    // 计算block线程布局(x,y和thread_num)
+    const int block_dim_x = BN / TN;
+    const int block_dim_y = BM / TM;
+    const int thread_num = block_dim_x * block_dim_y; // 一个线程负责计算block中TM*TN个元素
+
+    // 当前线程对应thread tile的左上角元素在block中的索引
+    int tx = (threadIdx.x % block_dim_x) * TN;
+    int ty = (threadIdx.x / block_dim_x) * TM;
+
+    // __shared__ float As[BM][BK];
+    // __shared__ float Bs[BK][BN]; 
+    // 不再使用二维的形式初始化As,因为后面会将As转置,便于更自由分配数据
+    // 两倍用于缓存
+    __shared__ float As[2][BM * BK];
+    __shared__ float Bs[2][BK * BN];
+
+    // BM*BK是Block中的float数据总数，thread_num是Block中的thread总数
+    // BM*BK/4表示Block中的float4数据总数，则 BM*BK/4/thread_num表示一个thread要搬运ldg_a_num个float4，也即一个thread搬运float4需要ldg_a_num轮
+    const int ldg_a_num = BM * BK / 4 / thread_num; 
+    const int ldg_b_num = BK * BN / 4 / thread_num; 
+
+    // float4前，A和As的对于float的二维索引
+    // float4后，A和As的对于float4的二维索引
+    int a_tile_y = threadIdx.x / (BK / 4); 
+    int a_tile_x = threadIdx.x % (BK / 4) * 4; // 行主序，最内层索引
+    int a_tile_stride = BM / ldg_a_num; // 物理意义：a_tile_stride是block所有线程一次性总共能搬运多少行。 也可以(int a_tile_stride = thread_num / BK;?) 
+
+    // float4前，B和Bs的对于float的二维索引
+    // float4后，B和Bs的对于float4的二维索引
+    int b_tile_y = threadIdx.x / (BN / 4); 
+    int b_tile_x = threadIdx.x % (BN / 4) * 4; // 行主序，最内层索引
+    int b_tile_stride = BK / ldg_b_num; 
+
+    float accum[TM][TN] = {0.0f}; // 每个线程负责TM*TN个元素，则需要申请TM*TN个寄存器保存累加值
+
+    // 
+    float a_stash_reg[4 * ldg_a_num] = {0.0f}; // 每个线程搬运ldg_a_num轮，寄存器缓存ldg_a_num个float4元素，用于转置As矩阵
+    float b_stash_reg[4 * ldg_b_num] = {0.0f};
+
+    float a_reg[2][TM] = {0.0f};
+    float b_reg[2][TN] = {0.0f};
+
+    // 移动到当前block
+    A = &A[by * BM * K];
+    B = &B[bx * BN];
+    C = &C[by * BM * N + bx * BN];
+
+    // A --> a_stash_reg --> As --> a_reg
+    // first tile from global to shared 
+    // transfer: A --> As 搬运第一块数据到shared memory
+    #pragma unroll
+    for (int i = 0; i < BM; i += a_tile_stride) {
+        int ldg_index = i / a_tile_stride * 4;  // i/a_tile_stride就是循环次数(1,2,...,ldg_a_num)，4Mul用于取数
+        FLOAT4(a_stash_reg[ldg_index]) = reinterpret_cast<const float4*>(&A[(a_tile_y + i) * K + a_tile_x])[0];
+        // As转置存，其中ldg_a_reg做中间缓存，目的是读取时可以按FLOAT4读取
+        As[0][OFFSET(a_tile_x    , a_tile_y + i, BM)] = a_stash_reg[ldg_index    ];
+        As[0][OFFSET(a_tile_x + 1, a_tile_y + i, BM)] = a_stash_reg[ldg_index + 1];
+        As[0][OFFSET(a_tile_x + 2, a_tile_y + i, BM)] = a_stash_reg[ldg_index + 2];
+        As[0][OFFSET(a_tile_x + 3, a_tile_y + i, BM)] = a_stash_reg[ldg_index + 3];
+    }
+    // transfer: B --> Bs 搬运第一块数据到shared memory
+    #pragma unroll
+    for (int i = 0; i < BK; i += b_tile_stride) {
+        FLOAT4(Bs[0][OFFSET(b_tile_y + i, b_tile_x, BN)]) = reinterpret_cast<const float4*>(&B[OFFSET(b_tile_y + i, b_tile_x, N)])[0]; 
+    } 
+
+    __syncthreads();
+    // transfer: As --> a_reg 搬运第一块数据到寄存器
+    #pragma unroll
+    for (int y = 0; y < TM; y += 4) {
+        FLOAT4(a_reg[0][y]) = FLOAT4(As[0][OFFSET(0, ty + y, BM)]);
+    }
+    // transfer: Bs --> b_reg 搬运第一块数据到寄存器
+    #pragma unroll
+    for (int x = 0; x < TN; x += 4) {
+        FLOAT4(b_reg[0][x]) = FLOAT4(Bs[0][OFFSET(0, tx + x, BN)]);
+    }
+    
+    int write_index = 1;
+    int load_index = 0;
+    int k = 0;
+    do {  
+        // A += BK;
+        // B += BK * N;
+        // 窗口滑动的逻辑直接用k写到A和B的索引中了，不用再滑动了
+        k += BK;
+        if (k < K) {
+            // A --> a_stash_reg 设为第num轮
+            #pragma unroll
+            for (int i = 0; i < BM; i += a_tile_stride) {
+                int ldg_index = i / a_tile_stride * 4;  // i/a_tile_stride就是循环次数(1,2,...,ldg_a_num)，4Mul用于取数
+                FLOAT4(a_stash_reg[ldg_index]) = reinterpret_cast<const float4*>(&A[(a_tile_y + i) * K + (k + a_tile_x)])[0]; // 不再使用A += BK更新A索引
+            }
+            // B --> b_stash_reg 第num轮
+            #pragma unroll
+            for (int i = 0; i < BK; i += b_tile_stride) {
+                int ldg_index = i / b_tile_stride * 4; 
+                FLOAT4(b_stash_reg[ldg_index]) = reinterpret_cast<const float4*>(&B[(k + b_tile_y + i) * N + b_tile_x])[0];
+            }
+        }
+
+        load_index = write_index ^ 1;
+
+        #pragma unroll
+        for (int k_inner = 0; k_inner < BK - 1; k_inner++) {  // 计算了BK-1次，因为是加载下一次迭代的数据，所以可以隐藏“从shared memory加载到寄存器的访存延迟”。
+            // transfer: 第num+1轮的 As --> a_reg, Bs --> b_reg
+            #pragma unroll
+            for (int y = 0; y < TM; y += 4) {
+                FLOAT4(a_reg[(k_inner + 1) % 2][y]) = FLOAT4(As[load_index][OFFSET(k_inner + 1, ty + y, BM)]);
+            }
+            #pragma unroll
+            for (int x = 0; x < TN; x += 4) {
+                FLOAT4(b_reg[(k_inner + 1) % 2][x]) = FLOAT4(Bs[load_index][OFFSET(k_inner + 1, tx + x, BN)]); 
+            }
+            // compute: 第num轮的compute流程
+            #pragma unroll
+            for (int y = 0; y < TM; y++) {
+                #pragma unroll
+                for (int x = 0; x < TN; x++) {
+                    accum[y][x] += a_reg[k_inner % 2][y] * b_reg[k_inner % 2][x];
+                }
+            }
+        }
+
+        if (k < K) {
+            // a_stash_reg --> As，第num轮的流程
+            #pragma unroll
+            for (int i = 0; i < BM; i += a_tile_stride) {
+                int ldg_index = i / a_tile_stride * 4; // i/a_tile_stride就是循环次数(1,2,...,ldg_a_num)，4Mul用于取数
+                As[write_index][OFFSET(a_tile_x,     i + a_tile_y, BM)] = a_stash_reg[ldg_index    ];
+                As[write_index][OFFSET(a_tile_x + 1, i + a_tile_y, BM)] = a_stash_reg[ldg_index + 1];
+                As[write_index][OFFSET(a_tile_x + 2, i + a_tile_y, BM)] = a_stash_reg[ldg_index + 2];
+                As[write_index][OFFSET(a_tile_x + 3, i + a_tile_y, BM)] = a_stash_reg[ldg_index + 3];
+            }
+            // b_stash_reg --> Bs，第num轮的流程
+            #pragma unroll
+            for (int i = 0; i < BK; i += b_tile_stride) {
+                int ldg_index = i / b_tile_stride * 4;
+                FLOAT4(Bs[write_index][OFFSET(b_tile_y + i, b_tile_x, BN)]) = FLOAT4(b_stash_reg[ldg_index]);
+            }
+            __syncthreads();
+            write_index ^= 1;
+        }
+
+        // transfer: 第num轮剩余的 As --> a_reg, Bs --> b_reg
+        #pragma unroll
+        for (int y = 0; y < TM; y += 4) {
+            FLOAT4(a_reg[0][y]) = FLOAT4(As[load_index ^ 1][OFFSET(0, ty + y, BM)]);
+        }
+        #pragma unroll
+        for (int x = 0; x < TN; x += 4) {
+            FLOAT4(b_reg[0][x]) = FLOAT4(Bs[load_index ^ 1][OFFSET(0, tx + x, BN)]); 
+        }
+
+        // compute: 第num轮的最后一次计算
+        #pragma unroll
+        for (int y = 0; y < TM; y++) {  // 前面只计算了BK-1次，这里计算第BK次
+            #pragma unroll
+            for (int x = 0; x < TN; x++) {
+                accum[y][x] += a_reg[1][y] * b_reg[1][x];
+            }
+        }
+
+    } while (k < K);
+    
+    #pragma unroll
+    for (int y = 0; y < TM; y++) {
+        #pragma unroll
+        for (int x = 0; x < TN; x += 4) {
+            FLOAT4(C[(ty + y) * N + (tx + x)]) = FLOAT4(accum[y][x]);
+        }
+    }
+}
+void iSgemmThreadTiled_float4_doubleBuffer(int M, int N, int K,
+                        const float* __restrict__ A, int lda,
+                        const float* __restrict__ B, int ldb,
+                        float* C, int ldc)
+{
+    dim3 block(256);
+    dim3 grid(CEIL(N, 128), CEIL(M, 128));
+
+    kSgemmThreadTiled_float4_doubleBuffer<128, 128, 8, 8, 8><<<grid, block>>>(A, B, C, M, N, K);
+}
 
 
 // initialize matrix
@@ -822,11 +1017,14 @@ void verifyResult(const float* host, const float* kernel, size_t size, double ep
 
         if (rel_err > eps) {
             ++num_bad;
-            // std::cout << "host " << host[i] << ", kernel " << kernel[i] << std::endl;
+            // std::cout << i << ": " << host[i] << ", kernel " << kernel[i] << std::endl;
+            return;
         }
 
-        if (diff > max_abs_err)
+        if (diff > max_abs_err) {
             max_abs_err = diff;
+        }
+
         sum_abs_err += diff;
     }
 
@@ -887,7 +1085,7 @@ int main(int argc, char** argv)
     iStart = seconds();
     sgemm_cpu(M, N, K, hA, lda, hB, ldb, hC, ldc);
     iElaps = seconds() - iStart;
-    std::cout << GREEN << "[host]: elapsed = " << iElaps * 1000 << " ms, " << RESET << std::endl << std::endl;
+    std::cout << GREEN << "[host]: elapsed = " << iElaps * 1000 << " ms " << RESET << std::endl << std::endl;
 
     // navie
     CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
@@ -897,6 +1095,9 @@ int main(int argc, char** argv)
     memset(kernel_C, 0, sizeC * sizeof(float));
     CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(hC, kernel_C, M * N, 1e-3);  
+
+    // using navie result as baseline
+    memcpy(hC, kernel_C, sizeC * sizeof(float));
 
     CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{iSgemmBlockTiled(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
@@ -951,12 +1152,20 @@ int main(int argc, char** argv)
     " [device thread tile float4 without transpose]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(kernel_C, 0, sizeC * sizeof(float));
     CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
-    verifyResult(hC, kernel_C, M * N, 1e-3);  
+    verifyResult(hC, kernel_C, M * N, 1e-3); 
 
     CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{iSgemmThreadTiled_float4(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
     std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ <<
     " [device thread tile float4]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(kernel_C, 0, sizeC * sizeof(float));
+    CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(hC, kernel_C, M * N, 1e-3);   
+
+    CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
+    total_time = TIME_RECORD(repeat_times, ([&]{iSgemmThreadTiled_float4_doubleBuffer(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ <<
+    " [device thread tile float4 doubleBufer]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(kernel_C, 0, sizeC * sizeof(float));
     CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(hC, kernel_C, M * N, 1e-3);  

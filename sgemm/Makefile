@@ -7,7 +7,7 @@ OPENCV_LIBS = -L/usr/local/lib \
 all: ${CU_APPS}
 
 %: %.cu
-	nvcc -lineinfo -arch=sm_89 -o $@ $< -lcudadevrt $(OPENCV_INC) $(OPENCV_LIBS)
+	nvcc -lineinfo -arch=sm_89 -o $@ $< -lcudadevrt $(OPENCV_INC) $(OPENCV_LIBS) -diag-suppress 611
 
 clean:
 	rm -f ${CU_APPS} 

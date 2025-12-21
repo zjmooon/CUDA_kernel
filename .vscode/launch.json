@@ -10,7 +10,8 @@
             "stopAtEntry": false,
             "cwd": "${fileDirname}",
             "environment": [],
-            "preLaunchTask": "CUDA and OpenCV Build" // 必须与 tasks.json 的 label 一致
+            "preLaunchTask": "CUDA and OpenCV Build" 
         }
     ]
 }
+// 设置条件断点只观察第一个线程 threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0(一维block， 二维grid)
