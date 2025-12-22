@@ -1181,3 +1181,11 @@ int main(int argc, char** argv)
 
     return 1;
 }
+
+
+/*
+* reference:
+* https://github.com/Tongkaio/CUDA_Kernel_Samples/tree/master/sgemm
+* https://zhuanlan.zhihu.com/p/435908830
+* https://developer.nvidia.com/blog/cutlass-linear-algebra-cuda/
+*/ 
