@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <iostream>
 #include <random>
+#include <cmath>
 
 // SGEMV: Single-precision General Matrix-Vector multiplication
 // matrix_src: M * K; vector_src: K * 1; vector_dst: M * 1
@@ -58,12 +59,69 @@ __global__ void kGemv_ref(const float* __restrict__ matrix_src, const float* __r
 }
 void iSgemv_ref(const float* __restrict__ matrix_src, const float* __restrict__ vector_src, 
     float* __restrict__ vector_dst, int M, int K) {
-    int blockSize(32); // block 大小设置为warpSize
-    int gridSize(M); // 每个block负责一行
+    int blockSize(32); // block的大小设置为warpSize
+    int gridSize(M); // 每个block负责一行.每个 Block 只有一个线程束(Warp).在处理列数K较小的矩阵时非常高效
 
     kGemv_ref<<<gridSize, blockSize>>>(matrix_src, vector_src, vector_dst, M, K);
 }
 
+
+
+/*
+* softmax(xi) = exp(xi - M) / exp(xi - M).sum()
+* 以行为单位做softmax
+* 验证见reduce_softmax.cu
+*/ 
+__global__ void kSgemv_softmax(const float* __restrict__ input, float* __restrict__ output, int M, int N) 
+{
+    const int tx = threadIdx.x;
+    const int bx = blockIdx.x;
+
+    /* __shared__ float max_val_shared; // Block内共享变量
+    __shared__ float sum_val_shared; */
+
+    // max
+    // 先求出每个线程负责数据的max_val
+    float max_val = -FLT_MAX;
+    for (int i = tx; i < N; i += warpSize) {
+        max_val = fmaxf(input[bx * N + i], max_val);
+    }
+    // warp内归约求出每行最大值
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        max_val = fmaxf(max_val, __shfl_xor_sync(0XFFFFFFFF, max_val, offset));
+    } 
+    // __shfl_xor_sync: 已经求得max_val(每个线程中)
+    /* if (tx == 0) {
+        max_val_shared = max_val;
+    } */
+
+    // sum
+    float sum_val = 0.0f;
+    for (int i = tx; i < N; i += warpSize) {
+        /* sum_val += expf(input[bx * N + i] - max_val_shared); */
+        sum_val += expf(input[bx * N + i] - max_val);
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum_val += __shfl_xor_sync(0XFFFFFFFF, sum_val, offset);
+    }
+    // __shfl_xor_sync: 已经求得sum_val(每个线程中)
+    /* if (tx == 0) {
+        sum_val_shared = sum_val;
+    } */
+
+    // 对一行数据的所有数据做softmax
+    for (int i = tx; i < N; i += warpSize) {
+        output[bx * N + i] = expf(input[bx * N + i] - max_val) / sum_val;
+    }
+
+}
+void iSgemv_softmax(const float* __restrict__ input, float* __restrict__ output, int M, int N) {
+    int blockSize(32); // block的大小设置为warpSize
+    int gridSize(M); // 每个block负责一行.每个 Block 只有一个线程束(Warp).在处理列数K较小的矩阵时非常高效
+
+    kSgemv_softmax<<<gridSize, blockSize>>>(input, output, M, N);
+}
 
 
 void verifyResult(const float* host, const float* kernel, size_t size, double eps = 1e-3)
