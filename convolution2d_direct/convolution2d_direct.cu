@@ -26,15 +26,15 @@ void conv2d_direct_cpu(
         for (int oh = 0; oh < OH; ++oh) {
             for (int ow = 0; ow < OW; ++ow) {
                 float sum = 0.0f;
-                for (int ic = 0; ic < Cin; ++ic) {
+                for (int c = 0; c < Cin; ++c) {
                     for (int kh = 0; kh < KH; ++kh) {
                         for (int kw = 0; kw < KW; ++kw) {
                             int ih = oh * stride + kh - pad;  // 计算输入特征图的高度索引
                             int iw = ow * stride + kw - pad;
 
                             if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                                int in_idx = ic * H * W + ih * W + iw;
-                                int k_idx = oc * Cin * KH * KW + ic * KH * KW + kh * KW + kw;
+                                int in_idx = c * H * W + ih * W + iw;
+                                int k_idx = oc * Cin * KH * KW + c * KH * KW + kh * KW + kw;
 
                                 sum += input[in_idx] * kernel[k_idx];
                             }
@@ -68,7 +68,7 @@ __global__ void kConv2dDirect_naive(
 
     float sum = 0.f;
 
-    for (int ic = 0; ic < Cin; ++ic) {
+    for (int c = 0; c < Cin; ++c) {
         for (int kh = 0; kh < KH; ++kh) {
             for (int kw = 0; kw < KW; ++kw) {
                 int ih = out_y * stride + kh - pad;
@@ -76,13 +76,13 @@ __global__ void kConv2dDirect_naive(
 
                 if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
                     int in_idx =
-                        ic * H * W + ih * W + iw;
-                    int w_idx =
+                        c * H * W + ih * W + iw;
+                    int k_idx =
                         out_c * Cin * KH * KW +
-                        ic * KH * KW +
+                        c * KH * KW +
                         kh * KW + kw;
 
-                    sum += input[in_idx] * d_kernel_const[w_idx];
+                    sum += input[in_idx] * d_kernel_const[k_idx];
                 }
             }
         }
@@ -101,8 +101,8 @@ void iConv2dDirect_naive(
 {
     dim3 block(16, 16);
     dim3 grid(
-        (OW + block.x - 1) / block.x,
-        (OH + block.y - 1) / block.y,
+        CEIL(OW, block.x),
+        CEIL(OH, block.y),
         Cout
     );
 
@@ -117,9 +117,9 @@ void iConv2dDirect_naive(
 
 
 
-// gpu shared memory optimized
+// gpu shared memory optimized / block tile
 // https://github.com/eunomia-bpf/basic-cuda-tutorial/blob/main/06-cnn-convolution.cu
-__global__ void kConv2dDirect_shared(
+__global__ void kConv2dDirect_blocked(
     const float* __restrict__ input,   // [Cin][H][W]
     float* __restrict__ output,        // [Cout][OH][OW]
     int Cin, int H, int W,
@@ -139,10 +139,11 @@ __global__ void kConv2dDirect_shared(
     const int tileWithPad = tile_size + KERNEL_SIZE - 1;
     const int out_x = bx * tile_size + tx;
     const int out_y = by * tile_size + ty;
+    const int out_c = blockIdx.z;
+    
     if (out_x >= OW || out_y >= OH) return;
     
-    const int out_c = blockIdx.z;
-    const int block_idx = tx + tile_size * ty ; // 二维block中的块内索引
+    // const int block_idx = tx + tile_size * ty ; // 二维block中的块内索引
     const int in_start_x = bx * tile_size * stride - pad;
     const int in_start_y = by * tile_size * stride - pad;
     
@@ -162,32 +163,30 @@ __global__ void kConv2dDirect_shared(
     __syncthreads();
 
     
-
+    // compute
     float sum = 0.f;
+    for (int c = 0; c < Cin; ++c) {
+        for (int ky = 0; ky < KH; ++ky) {
+            for (int kx = 0; kx < KW; ++kx) {
+                // shared memory 索引
+                int shared_x = tx * stride + kx;
+                int shared_y = ty * stride + ky;
+                if (shared_x >= tileWithPad && shared_y >= tileWithPad) return;
 
-    for (int ic = 0; ic < Cin; ++ic) {
-        for (int kh = 0; kh < KH; ++kh) {
-            for (int kw = 0; kw < KW; ++kw) {
-                int ih = out_y * stride + kh - pad;
-                int iw = out_x * stride + kw - pad;
+                int shared_idx = c * tileWithPad * tileWithPad + 
+                                 shared_y * tileWithPad + shared_x;
+                int k_idx = out_c * Cin * KH * KW +
+                            c * KH * KW +
+                            ky * KW + kx;
 
-                if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                    int in_idx =
-                        ic * H * W + ih * W + iw;
-                    int w_idx =
-                        out_c * Cin * KH * KW +
-                        ic * KH * KW +
-                        kh * KW + kw;
-
-                    sum += input[in_idx] * d_kernel_const[w_idx];
-                }
+                sum += s_input[shared_idx] * d_kernel_const[k_idx];
             }
         }
     }
 
     output[out_c * OH * OW + out_y * OW + out_x] = sum;
 }
-void iConv2dDirect_shared(
+void iConv2dDirect_blocked(
     const float* __restrict__ input,   // [Cin][H][W]
     /* kernel, */  // [Cout][Cin][KH][KW]
     float* __restrict__ output,        // [Cout][OH][OW]
@@ -198,16 +197,16 @@ void iConv2dDirect_shared(
 {
     dim3 block(16, 16);
     dim3 grid(
-        (OW + block.x - 1) / block.x,
-        (OH + block.y - 1) / block.y,
+        CEIL(OW, block.x),
+        CEIL(OH, block.y),
         Cout
     );
 
-    const int tileSize = block.x + KW - 1;
+    const int tileSize = block.x;
     const int tileSizeWithPad = tileSize + KERNEL_SIZE- 1; 
     const int sharedMemBytes = INPUT_CHANNELS * tileSizeWithPad * tileSizeWithPad * sizeof(float);
 
-    kConv2dDirect_shared<<<grid, block, sharedMemBytes>>>(
+    kConv2dDirect_blocked<<<grid, block, sharedMemBytes>>>(
         input, output,
         Cin, H, W,
         Cout, KH, KW,
@@ -225,7 +224,7 @@ void init_random(std::vector<float>& input, std::vector<float>& kernel, float lo
     for (auto& v : kernel) v = dist(gen);
 }
 
-void  verifyResult(const float* host, const float* kernel, size_t size, double eps = 1e-3)
+void verifyResult(const float* host, const float* kernel, size_t size, double eps = 1e-3)
 {
     double max_abs_err = 0.0;
     double sum_abs_err = 0.0;
@@ -321,7 +320,7 @@ int main() {
     iElaps = seconds() - iStart;
     std::cout << GREEN << "[host]: elapsed = " << iElaps * 1000 << " ms " << RESET << std::endl << std::endl;
 
-
+    // gpu naive (constant memory for kernel)
     CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{
         iConv2dDirect_naive(
@@ -339,9 +338,10 @@ int main() {
     CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);
 
+    // gpu blocked
     CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{
-        iConv2dDirect_shared(
+        iConv2dDirect_blocked(
             d_input,
             d_output,
             INPUT_CHANNELS, H, W,
@@ -351,7 +351,7 @@ int main() {
         );
     }));
     std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
-    " [device shared]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    " [device blocked]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(float));
     CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);
