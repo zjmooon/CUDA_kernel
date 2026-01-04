@@ -8,6 +8,7 @@
             "args": [
                 "-g",                // CPU 调试信息
                 "-G",                // GPU 调试信息（开启后可调试 Kernel 内部）
+                "-O0",               // 关闭优化，便于调试
                 "${file}",           // 当前打开的 .cu 文件
                 "-o",
                 "${fileDirname}/${fileBasenameNoExtension}",

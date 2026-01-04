@@ -14,4 +14,4 @@
         }
     ]
 }
-// 设置条件断点只观察第一个线程 threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0(一维block， 二维grid)
+// 设置条件断点只观察第一个线程 threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0
