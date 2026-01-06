@@ -277,7 +277,10 @@ void iConv2dDirect_blocked(
 } 
 
 
-
+/*
+* kConv2dDirect_blocked版本其实是将核函数从memory-bound 转换为 compute-bound 问题
+* 解决办法就是尽可能的提高线程利用率即单个线程负责更多output数据
+*/
 template<const int SHARED_SIZE_W,
          const int SHARED_SIZE_H, 
          const int N_TILE,
@@ -679,7 +682,7 @@ void verifyResult(const int* host, const int* kernel, size_t size, double eps = 
 * Output : N x Cout x OH x OW
 */
 int main() {
-    int repeat_times = 10;
+    int repeat_times = 1;
     float total_time;
     double iStart, iElaps;
     

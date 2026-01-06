@@ -16,3 +16,6 @@
      38.5        3,102,956         10  310,295.6  310,296.0   306,248   317,032      3,032.0  void kConv2dDirect_blocked<(int)18, (int)3>(const int *, int *, int, int, int, int, int, int, int, …
      35.8        2,886,247         10  288,624.7  283,879.0   283,143   309,639      8,938.2  kConv2dDirect_naive(const int *, int *, int, int, int, int, int, int, int, int, int, int)           
      25.7        2,066,482         10  206,648.2  204,773.0   203,429   224,773      6,387.2  void kConv2dDirect_1x8_Tiling<(int)130, (int)18, (int)8, (int)3>(const int *, int *, int, int, int,…
+
+
+ncu --metrics sm__inst_executed_pipe_alu.sum,sm__inst_executed_pipe_fma.sum,sm__inst_executed_pipe_int.sum,sm__warps_active.avg.pct_of_peak_sustained_active,smem__throughput.avg.pct_of_peak_sustained_elapsed,smem__bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_shared_op_ld.sum --kernel-name kConv2dDirect_1x8_Tiling   ./convolution2d_direct
