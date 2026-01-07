@@ -42,7 +42,7 @@ void conv2d_direct_cpu(
     int OH = (H + 2 * pad - KH) / stride + 1;
     int OW = (W + 2 * pad - KW) / stride + 1;
 
-    std::memset(output, 0, sizeof(int) * Cout * OH * OW);
+    memset(output, 0, sizeof(int) * Cout * OH * OW);
 
     for (int oc = 0; oc < Cout; ++oc) {
         for (int oh = 0; oh < OH; ++oh) {
@@ -194,7 +194,7 @@ __global__ void kConv2dDirect_blocked(
                     s_input[c * SHARED_SIZE * SHARED_SIZE + y * SHARED_SIZE + x] = value;
                 } */
 
-                s_input[y][x] = (in_x >=0 && in_x < W && in_y >=0 && in_y < H) ? 
+                s_input[y][x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
                     input[c * H * W + in_y * W + in_x] : 0; // 边界填充0
             }
         }
@@ -218,7 +218,7 @@ __global__ void kConv2dDirect_blocked(
             int in_x = in_start_x + x;
             int in_y = in_start_y + y;
 
-            s_input[c][y][x] = (in_x >=0 && in_x < W && in_y >=0 && in_y < H) ? 
+            s_input[c][y][x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
                 input[c * H * W + in_y * W + in_x] : 0; // 边界填充0
         } */
         
@@ -322,7 +322,7 @@ __global__ void kConv2dDirect_1x2_Tiling(
                 int in_y = in_start_y + y;
                 int in_x = in_start_x + x;
             
-                s_input[y][x] = (in_x >=0 && in_x < W && in_y >=0 && in_y < H) ? 
+                s_input[y][x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
                     input[c * H * W + in_y * W + in_x] : 0; // 填充0
             }
         }
@@ -412,7 +412,7 @@ __global__ void kConv2dDirect_1x4_Tiling(
                 int in_y = in_start_y + y;
                 int in_x = in_start_x + x;
             
-                s_input[y][x] = (in_x >=0 && in_x < W && in_y >=0 && in_y < H) ? 
+                s_input[y][x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
                     input[c * H * W + in_y * W + in_x] : 0; // 填充0
             }
         }
@@ -508,7 +508,7 @@ __global__ void kConv2dDirect_1x8_Tiling(
                 int in_y = in_start_y + y;
                 int in_x = in_start_x + x;
             
-                s_input[y][x] = (in_x >=0 && in_x < W && in_y >=0 && in_y < H) ? 
+                s_input[y][x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
                     input[c * H * W + in_y * W + in_x] : 0; // 填充0
             }
         }
