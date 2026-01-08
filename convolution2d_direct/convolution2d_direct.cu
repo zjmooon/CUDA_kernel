@@ -47,12 +47,12 @@ void conv2d_direct_cpu(
     for (int oc = 0; oc < Cout; ++oc) {
         for (int oh = 0; oh < OH; ++oh) {
             for (int ow = 0; ow < OW; ++ow) {
-                int sum = 0.0f;
+                int sum = 0;
                 for (int c = 0; c < Cin; ++c) {
                     for (int ky = 0; ky < KH; ++ky) {
                         for (int kx = 0; kx < KW; ++kx) {
-                            int in_y = oh * stride + ky - pad;  // 计算输入特征图的高度索引
-                            int in_x = ow * stride + kx - pad;
+                            int in_y = oh * stride + ky - pad; // 计算输入特征图的y轴索引
+                            int in_x = ow * stride + kx - pad; // x轴索引
 
                             if (in_y >= 0 && in_y < H && in_x >= 0 && in_x < W) {
                                 int in_idx = c * H * W + in_y * W + in_x;
@@ -72,6 +72,7 @@ void conv2d_direct_cpu(
 
 
 // gpu naive
+// 对于pad，其实可以在·cpu端预填充避免kernel中大量if判断。预留pad保证完整逻辑
 __global__ void kConv2dDirect_naive(
     const int* __restrict__ input,   // [Cin][H][W]
     /* const int* __restrict__ kernel, */  // [Cout][Cin][KH][KW]
@@ -90,16 +91,16 @@ __global__ void kConv2dDirect_naive(
 
     int sum = 0;
 
-    int in_start_y = out_y * stride - pad;
-    int in_start_x = out_x * stride - pad;
+    int in_start_y = out_y * stride - pad; // 计算输入特征图的y轴索引base
+    int in_start_x = out_x * stride - pad; // x轴索引base
 
     # pragma unroll
     for (int c = 0; c < Cin; ++c) {
         # pragma unroll
         for (int ky = 0; ky < KH; ++ky) {
+            int in_y = in_start_y + ky;
             # pragma unroll
             for (int kx = 0; kx < KW; ++kx) {
-                int in_y = in_start_y + ky;
                 int in_x = in_start_x + kx;
 
                 if (in_y >= 0 && in_y < H && in_x >= 0 && in_x < W) {
@@ -166,9 +167,9 @@ __global__ void kConv2dDirect_blocked(
     const int out_y = blockIdx.y * blockDim.y + ty;
     const int out_c = blockIdx.z;
     
-    // if (out_x >= OW || out_y >= OH) return;
+    // if (out_x >= OW || out_y >= OH) return;  // 会与后续的__syncthreads() 构成死锁
     
-    const int in_start_y = blockIdx.y * blockDim.y * stride - pad;
+    const int in_start_y = blockIdx.y * blockDim.y * stride - pad; // 计算输入特征图像素在shared memory中的y轴索引base
     const int in_start_x = blockIdx.x * blockDim.x * stride - pad;
 
     int sum = 0;
@@ -180,10 +181,10 @@ __global__ void kConv2dDirect_blocked(
         // 1_1: 直接二维循环加载到共享内存
         # pragma unroll
         for (int y = ty; y < SHARED_SIZE; y += blockDim.y) {
+            int in_y = in_start_y + y;
             # pragma unroll
             for (int x = tx; x < SHARED_SIZE; x += blockDim.x) {
                 int in_x = in_start_x + x;
-                int in_y = in_start_y + y;
 
                 /* int value = 0; 
                 if (in_y >= 0 && in_y < H && in_x >= 0 && in_x < W) {
@@ -316,10 +317,9 @@ __global__ void kConv2dDirect_1x2_Tiling(
         // 合并访存以及避免Bank Conflict
         # pragma unroll
         for (int y = ty; y < SHARED_SIZE_H; y += blockDim.y) {
+            int in_y = in_start_y + y;
             # pragma unroll
             for (int x = tx; x < SHARED_SIZE_W; x += blockDim.x) {
-                
-                int in_y = in_start_y + y;
                 int in_x = in_start_x + x;
             
                 s_input[y][x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
@@ -406,10 +406,9 @@ __global__ void kConv2dDirect_1x4_Tiling(
         // 合并访存以及避免Bank Conflict
         # pragma unroll
         for (int y = ty; y < SHARED_SIZE_H; y += blockDim.y) {
+            int in_y = in_start_y + y;
             # pragma unroll
             for (int x = tx; x < SHARED_SIZE_W; x += blockDim.x) {
-                
-                int in_y = in_start_y + y;
                 int in_x = in_start_x + x;
             
                 s_input[y][x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
@@ -496,16 +495,14 @@ __global__ void kConv2dDirect_1x8_Tiling(
     int sum6 = 0;
     int sum7 = 0;
     
-
     for (int c = 0; c < Cin; c++) {
         // global to shared memory 
         // 合并访存以及避免Bank Conflict
         # pragma unroll
         for (int y = ty; y < SHARED_SIZE_H; y += blockDim.y) {
+            int in_y = in_start_y + y;
             # pragma unroll
             for (int x = tx; x < SHARED_SIZE_W; x += blockDim.x) {
-                
-                int in_y = in_start_y + y;
                 int in_x = in_start_x + x;
             
                 s_input[y][x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
