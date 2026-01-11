@@ -5,7 +5,7 @@
 
 #define INPUT_CHANNELS 3
 #define OUTPUT_CHANNELS 1
-#define KERNEL_SIZE 3
+#define KERNEL_SIZE 7
 #define BLOCK_SIZE 16
 #define STRIDE 1
 #define PADDING 0
@@ -128,7 +128,7 @@ void iConv2dDirect_naive(
     int OH, int OW,
     int stride, int pad ) 
 {
-    dim3 block(16, 16);
+    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
     dim3 grid(
         CEIL(OW, block.x),
         CEIL(OH, block.y),
@@ -485,7 +485,7 @@ __global__ void kConv2dDirect_1x8_Tiling(
 
     const int in_start_y = blockIdx.y * blockDim.y - pad;
     const int in_start_x = blockIdx.x * blockDim.x * N_TILE - pad;
-
+    
     int sum0 = 0;
     int sum1 = 0;
     int sum2 = 0;
@@ -605,9 +605,165 @@ void iConv2dDirect_N_Tiling(
     default:
         break;
     }
+} 
 
 
 
+/* 
+* 使用int4向量化优化。
+* Using vectorized loads reduces the total number of instructions, reduces latency, and improves bandwidth utilization.
+* 线程布局在grid维度最内层除以4。
+* https://developer.nvidia.com/blog/cuda-pro-tip-increase-performance-with-vectorized-memory-access/
+*/
+template<const int SHARED_SIZE_W,
+         const int SHARED_SIZE_H, 
+         const int N_TILE,
+         const int CIN>
+__global__ void kConv2dDirect_1x8_Tiling_int4(
+    const int* __restrict__ input,   // [Cin][H][W]
+    int* __restrict__ output,        // [Cout][OH][OW]
+    int Cin, int H, int W,
+    int Cout, int KH, int KW,
+    int OH, int OW,
+    int stride, int pad  // stride == 1
+) 
+{
+    __shared__ int s_input[SHARED_SIZE_H][SHARED_SIZE_W];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int out_x_0 = blockIdx.x * blockDim.x * N_TILE + tx;
+    const int out_x_1 = out_x_0 + blockDim.x;
+    const int out_x_2 = out_x_1 + blockDim.x;
+    const int out_x_3 = out_x_2 + blockDim.x;
+    const int out_x_4 = out_x_3 + blockDim.x;
+    const int out_x_5 = out_x_4 + blockDim.x;
+    const int out_x_6 = out_x_5 + blockDim.x;
+    const int out_x_7 = out_x_6 + blockDim.x;
+
+    const int out_y = blockIdx.y * blockDim.y + ty;
+    const int out_c = blockIdx.z;
+
+    // if (out_y >= OH || out_c >= Cout) return;  // 会与后续的__syncthreads() 构成死锁
+
+    const int in_start_y = blockIdx.y * blockDim.y - pad;
+    const int in_start_x = blockIdx.x * blockDim.x * N_TILE - pad;
+
+    int sum0 = 0;
+    int sum1 = 0;
+    int sum2 = 0;
+    int sum3 = 0;
+    int sum4 = 0;
+    int sum5 = 0;
+    int sum6 = 0;
+    int sum7 = 0;
+    
+    for (int c = 0; c < Cin; c++) {
+        // global to shared memory 
+        // 合并访存以及避免Bank Conflict
+        # pragma unroll
+        for (int y = ty; y < SHARED_SIZE_H; y += blockDim.y) {
+            int in_y = in_start_y + y;
+            bool y_valid = (in_y >= 0 && in_y < H); // 增加 y 有效性检查
+
+            # pragma unroll
+            for (int x = tx * 4; x < SHARED_SIZE_W; x += blockDim.x * 4) {
+                int in_x = in_start_x + x;
+                int4 v = {0, 0, 0, 0};
+
+                // 只有当起始地址对齐且不越界时才使用 int4
+                if (y_valid && in_x >= 0 && in_x + 3 < W) {
+                    v = reinterpret_cast<const int4*>(&input[c * H * W + in_y * W + in_x])[0];
+                } 
+                else {
+                    // 逐个元素读取，同时检查 y_valid 和 x 范围
+                    if (y_valid) {
+                        if (in_x + 0 >= 0 && in_x + 0 < W) v.x = input[c * H * W + in_y * W + in_x + 0];
+                        if (in_x + 1 >= 0 && in_x + 1 < W) v.y = input[c * H * W + in_y * W + in_x + 1];
+                        if (in_x + 2 >= 0 && in_x + 2 < W) v.z = input[c * H * W + in_y * W + in_x + 2];
+                        if (in_x + 3 >= 0 && in_x + 3 < W) v.w = input[c * H * W + in_y * W + in_x + 3];
+                    }
+                }
+
+                // 边界，避免写入s_input[y][131]的情况
+                if (x + 0 < SHARED_SIZE_W) s_input[y][x + 0] = v.x;
+                if (x + 1 < SHARED_SIZE_W) s_input[y][x + 1] = v.y;
+                if (x + 2 < SHARED_SIZE_W) s_input[y][x + 2] = v.z;
+                if (x + 3 < SHARED_SIZE_W) s_input[y][x + 3] = v.w;
+            }
+        }
+        __syncthreads();
+        
+        // convolution compute
+        # pragma unroll
+        for (int ky = 0; ky < KH; ++ky) {
+            int shared_idx_y = ty + ky;
+            # pragma unroll
+            for (int kx = 0; kx < KW; ++kx) {
+                int f = d_kernel_const[out_c * Cin * KH * KW +
+                            c * KH * KW +
+                            ky * KW + kx];
+                
+                // shared memory 索引映射
+                int shared_x0 = tx + kx;
+
+                int s0 = s_input[shared_idx_y][shared_x0];
+                int s1 = s_input[shared_idx_y][shared_x0 + blockDim.x];
+                int s2 = s_input[shared_idx_y][shared_x0 + blockDim.x * 2];
+                int s3 = s_input[shared_idx_y][shared_x0 + blockDim.x * 3];
+                int s4 = s_input[shared_idx_y][shared_x0 + blockDim.x * 4];
+                int s5 = s_input[shared_idx_y][shared_x0 + blockDim.x * 5];
+                int s6 = s_input[shared_idx_y][shared_x0 + blockDim.x * 6];
+                int s7 = s_input[shared_idx_y][shared_x0 + blockDim.x * 7];
+
+                sum0 += s0 * f;
+                sum1 += s1 * f;
+                sum2 += s2 * f;
+                sum3 += s3 * f;
+                sum4 += s4 * f;
+                sum5 += s5 * f;
+                sum6 += s6 * f;
+                sum7 += s7 * f;
+            }
+        }
+        __syncthreads();
+    }
+
+    int base = out_c * OH * OW + out_y * OW;
+    if (out_x_0 < OW) output[base + out_x_0] = sum0;
+    if (out_x_1 < OW) output[base + out_x_1] = sum1;
+    if (out_x_2 < OW) output[base + out_x_2] = sum2;
+    if (out_x_3 < OW) output[base + out_x_3] = sum3;
+    if (out_x_4 < OW) output[base + out_x_4] = sum4;
+    if (out_x_5 < OW) output[base + out_x_5] = sum5;
+    if (out_x_6 < OW) output[base + out_x_6] = sum6;
+    if (out_x_7 < OW) output[base + out_x_7] = sum7;
+    
+}
+void iConv2dDirect_8_Tiling_int4(
+    const int* __restrict__ input,   // [Cin][H][W]
+    /* kernel, */  // [Cout][Cin][KH][KW]
+    int* __restrict__ output,        // [Cout][OH][OW]
+    int Cin, int H, int W,
+    int Cout, int KH, int KW,
+    int OH, int OW,
+    int stride, int pad) 
+{
+    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 grid(
+        CEIL(OW, block.x * NTILING),
+        CEIL(OH, block.y),
+        Cout
+    );
+
+    kConv2dDirect_1x8_Tiling_int4<TILE_SHARED_N, TILE_SHARED, NTILING, INPUT_CHANNELS><<<grid, block>>>(
+        input, output,
+        Cin, H, W,
+        Cout, KH, KW,
+        OH, OW,
+        1, pad 
+    );
 } 
 
 
@@ -679,11 +835,11 @@ void verifyResult(const int* host, const int* kernel, size_t size, double eps = 
 * Output : N x Cout x OH x OW
 */
 int main() {
-    int repeat_times = 1;
+    int repeat_times = 10;
     float total_time;
     double iStart, iElaps;
     
-    int H = 1024*8, W = 1024*8;
+    int H = 2160, W = 3840;
     int KH = KERNEL_SIZE, KW = KERNEL_SIZE;
     int stride = STRIDE, pad = PADDING;
 
@@ -778,7 +934,31 @@ int main() {
     memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(int));
     CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(int), cudaMemcpyDeviceToHost));
     verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);
+
+    // int4
+    CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(int)));
+    total_time = TIME_RECORD(repeat_times, ([&]{
+        iConv2dDirect_8_Tiling_int4(
+            d_input,
+            d_output,
+            INPUT_CHANNELS, H, W,
+            OUTPUT_CHANNELS, KH, KW,
+            OH, OW,
+            stride, pad
+        );
+    }));
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
+    " [device 1x" << NTILING << " Tiling int4]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(int));
+    CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(int), cudaMemcpyDeviceToHost));
+    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);
+
+
+    cudaFree(d_input);
+    cudaFree(d_output);
+
     return 0;
+
 }
 
 
