@@ -23,7 +23,12 @@ void iVectorAdd_Naive(const float* A, const float* B, float* C, int N)
 }
 
 
-
+/* 
+* 在block tile的基础上使用float4向量化优化。
+* Using vectorized loads reduces the total number of instructions, reduces latency, and improves bandwidth utilization.
+* 线程布局在grid维度最内层除以4。
+* https://developer.nvidia.com/blog/cuda-pro-tip-increase-performance-with-vectorized-memory-access/
+*/
 __global__ void kVectorAdd_Float4(const float* __restrict__ A, const float* __restrict__ B, 
     float* __restrict__ C, int N) 
 {
