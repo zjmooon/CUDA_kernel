@@ -21,6 +21,16 @@
     }                                                                          \
 }
 
+#define CHECK_CUDNN(call) \
+    do { \
+        cudnnStatus_t status = call; \
+        if (status != CUDNN_STATUS_SUCCESS) { \
+            std::cerr << "cuDNN error: " << cudnnGetErrorString(status) << std::endl; \
+            exit(1); \
+        } \
+    } while (0)
+    
+
 #define TIME_RECORD(N, func)                                                                    \
     [&] {                                                                                       \
         float total_time = 0;                                                                   \
