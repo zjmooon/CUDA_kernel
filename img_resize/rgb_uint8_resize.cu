@@ -13,7 +13,7 @@ __global__ void kImageUint8Resize_nearest(unsigned char* __restrict__ src, unsig
     int srcX = round(static_cast<float>(gx) * scaleW);
     int srcY = round(static_cast<float>(gy) * scaleH);
 
-    if (srcX < 0 || srcX > srcW || srcY < 0 || srcY > srcH ) return;
+    if (srcX < 0 || srcX >= srcW || srcY < 0 || srcY >= srcH) return;
 
     int dstIdx = (gy * dstW + gx) * 3;
     int srcIdx = (srcY * srcW + srcX) * 3;
@@ -30,14 +30,14 @@ void iImageUint8Resize_nearest(unsigned char* __restrict__ src, unsigned char* _
     dim3 blockSize(16, 16);
     dim3 gridSize(CEIL(dstW, blockSize.x), CEIL(dstH, blockSize.y));
 
-    float scaleH = static_cast<float>(srcH / dstH); 
-    float scaleW = static_cast<float>(srcW / dstW); 
+    float scaleH = static_cast<float>(srcH) / dstH;
+    float scaleW = static_cast<float>(srcW) / dstW;
     float scale = scaleW > scaleH ? scaleW : scaleH;
-    
     if (isKeepHW) {
         scaleW = scale;
         scaleH = scale;
     }
+
     kImageUint8Resize_nearest<<<gridSize, blockSize>>>(src, dst, srcH, srcW, dstH, dstW, scaleH, scaleW);
 }
 
@@ -45,27 +45,26 @@ void iImageUint8Resize_nearest(unsigned char* __restrict__ src, unsigned char* _
 /* 
 * 最邻近插值，图像保持原高宽比，且居中显示，偏移部分用0 padding
 */
-__global__ void kImageUint8Resize_nearest_center(unsigned char* __restrict__ src, unsigned char* __restrict__ dst, 
-                    int srcH, int srcW, int dstH, int dstW, float scaleH, float scaleW)
+__global__ void kImageUint8Resize_nearest_center(const unsigned char* __restrict__ src, unsigned char* __restrict__ dst, 
+                    int srcH, int srcW, int dstH, int dstW, float scaleH, float scaleW, int offsetX, int offsetY)
 {
+
     int gx = threadIdx.x + blockDim.x * blockIdx.x;
     int gy = threadIdx.y + blockDim.y * blockIdx.y;
 
-    int srcX = round(static_cast<float>(gx) * scaleW);
-    int srcY = round(static_cast<float>(gy) * scaleH);
+    const uchar3* uc3_src = reinterpret_cast<const uchar3*>(src);
+    uchar3* uc3_dst = reinterpret_cast<uchar3*>(dst);
 
-    if (srcX < 0 || srcX > srcW || srcY < 0 || srcY > srcH ) return;
+    int srcX = __float2int_rn(static_cast<float>(gx) * scaleW);
+    int srcY = __float2int_rn(static_cast<float>(gy) * scaleH);
+
+    if (srcX < 0 || srcX >= srcW || srcY < 0 || srcY >= srcH ) return;
 
     // 计算像素在目标图上的x,y方向上的偏移量
-    gy = gy + int(dstH / 2) - int(srcH / (scaleH * 2));
-    gx = gx + int(dstW / 2) - int(srcW / (scaleW * 2));
+    gy = gy + offsetY;
+    gx = gx + offsetX;
 
-    int dstIdx = (gy * dstW + gx) * 3;
-    int srcIdx = (srcY * srcW + srcX) * 3;
-
-    dst[dstIdx    ] = src[srcIdx    ];
-    dst[dstIdx + 1] = src[srcIdx + 1];
-    dst[dstIdx + 2] = src[srcIdx + 2];
+    uc3_dst[gy * dstW + gx] = uc3_src[srcY * srcW + srcX];
 }
 void iImageUint8Resize_nearest_center(unsigned char* __restrict__ src, unsigned char* __restrict__ dst, 
                   int srcH, int srcW, int dstH, int dstW) 
@@ -78,29 +77,82 @@ void iImageUint8Resize_nearest_center(unsigned char* __restrict__ src, unsigned 
     dim3 blockSize(16, 16);
     dim3 gridSize(CEIL(dstW, blockSize.x), CEIL(dstH, blockSize.y));
 
-    float scaleH = static_cast<float>(srcH / dstH); 
-    float scaleW = static_cast<float>(srcW / dstW); 
+    float scaleH = static_cast<float>(srcH) / dstH; 
+    float scaleW = static_cast<float>(srcW) / dstW; 
     float scale = scaleW > scaleH ? scaleW : scaleH;
-    
     scaleW = scale;
     scaleH = scale;
+    
+    int offsetX = int(dstW / 2) - int(srcW / (scaleW * 2));
+    int offsetY = int(dstH / 2) - int(srcH / (scaleH * 2));
 
-    kImageUint8Resize_nearest_center<<<gridSize, blockSize>>>(src, dst, srcH, srcW, dstH, dstW, scaleH, scaleW);
+    kImageUint8Resize_nearest_center<<<gridSize, blockSize>>>(src, dst, srcH, srcW, dstH, dstW, scaleH, scaleW, offsetX, offsetY);
 }
 
 
-/*
-* elementwise类型的算子优化方向: 
-* 在block tile的基础上使用uint4向量化优化。
-* Using vectorized loads reduces the total number of instructions, reduces latency, and improves bandwidth utilization.
-* 线程布局在block维度除以4。
-* https://developer.nvidia.com/blog/cuda-pro-tip-increase-performance-with-vectorized-memory-access/
-*/
 
+/* 
+* 最邻近插值，图像保持原高宽比，且居中显示，偏移部分用0 padding
+* 
+*/
+__global__ void kImageUint8Resize_nearest_center_gridStride_uchar3(const unsigned char* __restrict__ src, unsigned char* __restrict__ dst, 
+                    int srcH, int srcW, int dstH, int dstW, float scaleH, float scaleW, int offsetX, int offsetY)
+{
+    const uchar3* uc3_src = reinterpret_cast<const uchar3*>(src);
+    uchar3* uc3_dst = reinterpret_cast<uchar3*>(dst);
+
+    int g_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    const int uc3_pixelLength = dstH * dstW;
+
+    for (int i = g_id; i < uc3_pixelLength; i += stride) 
+    {
+        int dst_x = i % dstW; // 耗时 (Todo: using 2D <<<gridSize, blockSize>>> to avoid model_operate %)
+        int dst_y = i / dstW;
+
+        int src_x = __float2int_rn(static_cast<float>(dst_x) * scaleW);
+        int src_y = __float2int_rn(static_cast<float>(dst_y) * scaleH); 
+
+        if (src_x < 0 || src_x >= srcW || src_y < 0 || src_y >= srcH ) return;
+
+        // 计算像素在目标图上的x,y方向上的偏移量
+        dst_y += offsetY;
+        dst_x += offsetX;
+
+        uc3_dst[dst_y * dstW + dst_x] = uc3_src[src_y * srcW + src_x];
+    }
+}
+void iImageUint8Resize_nearest_center_gridStride_uchar3(unsigned char* __restrict__ src, unsigned char* __restrict__ dst, 
+                  int srcH, int srcW, int dstH, int dstW) 
+{
+    /*
+    * 线程布局以resized 的图像数据布局为根据。为每一个dstIdx 映射 srcIdx
+    * src_x = dst_x * scale_x
+    * src_y = dst_y * scale_y
+    */ 
+    int blockSize = 256;
+    int numSMs;
+    int dev;
+    CHECK(cudaGetDevice(&dev));
+    CHECK(cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, dev));
+    int gridSize = 16 * numSMs; 
+
+    float scaleH = static_cast<float>(srcH) / dstH; 
+    float scaleW = static_cast<float>(srcW) / dstW; 
+    float scale = scaleW > scaleH ? scaleW : scaleH;
+    scaleW = scale;
+    scaleH = scale;
+    
+    int offsetX = int(dstW / 2) - int(srcW / (scaleW * 2));
+    int offsetY = int(dstH / 2) - int(srcH / (scaleH * 2));
+
+    kImageUint8Resize_nearest_center_gridStride_uchar3<<<gridSize, blockSize>>>(src, dst, srcH, srcW, dstH, dstW, scaleH, scaleW, offsetX, offsetY);
+}
 
 // 双线性插值 bilinear interpolation
 __global__ void kImageUint8Resize_bilinear_center(unsigned char* __restrict__ src, unsigned char* __restrict__ dst, 
-                    int srcH, int srcW, int dstH, int dstW, float scaleH, float scaleW)
+                    int srcH, int srcW, int dstH, int dstW, float scaleH, float scaleW, int offsetX, int offsetY)
 {
 
     // resized图的坐标(gx, gy)
@@ -133,25 +185,25 @@ __global__ void kImageUint8Resize_bilinear_center(unsigned char* __restrict__ sr
     int srcIdx2_2 = (src_y2 * srcW + src_x2) * 3;  //右下
 
     // bilinear interpolation -- 计算原图在目标图中的x, y方向上的偏移量
-    gy = gy + int(dstH / 2) - int(srcH / (scaleH * 2));
-    gx = gx + int(dstW / 2) - int(srcW / (scaleW * 2));
+    gy = gy + offsetY;
+    gx = gx + offsetX;
 
     // bilinear interpolation -- 计算resized之后的图的索引
     int dstIdx = (gy * dstW  + gx) * 3;
 
-    dst[dstIdx + 0] = round(
+    dst[dstIdx + 0] = __float2int_rn(
                         a1_1 * src[srcIdx1_1 + 0] + 
                         a1_2 * src[srcIdx1_2 + 0] +
                         a2_1 * src[srcIdx2_1 + 0] +
                         a2_2 * src[srcIdx2_2 + 0]);
 
-    dst[dstIdx + 1] = round(
+    dst[dstIdx + 1] = __float2int_rn(
                         a1_1 * src[srcIdx1_1 + 1] + 
                         a1_2 * src[srcIdx1_2 + 1] +
                         a2_1 * src[srcIdx2_1 + 1] +
                         a2_2 * src[srcIdx2_2 + 1]);
 
-    dst[dstIdx + 2] = round(
+    dst[dstIdx + 2] = __float2int_rn(
                         a1_1 * src[srcIdx1_1 + 2] + 
                         a1_2 * src[srcIdx1_2 + 2] +
                         a2_1 * src[srcIdx2_1 + 2] +
@@ -164,14 +216,16 @@ void iImageUint8Resize_bilinear_center(unsigned char* __restrict__ src, unsigned
     dim3 blockSize(16, 16);
     dim3 gridSize(CEIL(dstW, blockSize.x), CEIL(dstH, blockSize.y));
 
-    float scaleH = static_cast<float>(srcH / dstH); 
-    float scaleW = static_cast<float>(srcW / dstW); 
+    float scaleH = static_cast<float>(srcH) / dstH; 
+    float scaleW = static_cast<float>(srcW) / dstW; 
     float scale = scaleW > scaleH ? scaleW : scaleH;
-    
     scaleW = scale;
     scaleH = scale;
 
-    kImageUint8Resize_bilinear_center<<<gridSize, blockSize>>>(src, dst, srcH, srcW, dstH, dstW, scaleH, scaleW);
+    int offsetX = int(dstW / 2) - int(srcW / (scaleW * 2));
+    int offsetY = int(dstH / 2) - int(srcH / (scaleH * 2));
+
+    kImageUint8Resize_bilinear_center<<<gridSize, blockSize>>>(src, dst, srcH, srcW, dstH, dstW, scaleH, scaleW, offsetX, offsetY);
 }
 
 
@@ -232,6 +286,13 @@ int main()
     memset(h_dst, 0, dst_bytes);
     CHECK(cudaMemcpy(h_dst, d_dst, dst_bytes, cudaMemcpyDeviceToHost));
     imageIO::saveBgrUint8(h_dst, dst_w, dst_h, "gpu_nearest_center.jpg"); 
+
+    CHECK(cudaMemset(d_dst, 0, dst_bytes));
+    total_time = TIME_RECORD(repeat_times, ([&]{iImageUint8Resize_nearest_center_gridStride_uchar3(d_src, d_dst, h_src.rows, h_src.cols, dst_h, dst_w);}));
+    std::cout << GREEN << std::endl << "[gpu nearest keep_height:width center gridStride uchar3]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(h_dst, 0, dst_bytes);
+    CHECK(cudaMemcpy(h_dst, d_dst, dst_bytes, cudaMemcpyDeviceToHost));
+    imageIO::saveBgrUint8(h_dst, dst_w, dst_h, "gpu_nearest_center_gridStride_uchar3.jpg"); 
 
     CHECK(cudaMemset(d_dst, 0, dst_bytes));
     total_time = TIME_RECORD(repeat_times, ([&]{iImageUint8Resize_bilinear_center(d_src, d_dst, h_src.rows, h_src.cols, dst_h, dst_w);}));
