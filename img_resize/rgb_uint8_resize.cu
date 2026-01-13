@@ -3,7 +3,7 @@
 #include <cuda_runtime.h>
 #include <opencv2/opencv.hpp>
 
-
+// 最邻近插值，是否保持原高宽比由布尔值isKeepHW决定
 __global__ void kImageUint8Resize_nearest(unsigned char* __restrict__ src, unsigned char* __restrict__ dst, 
                     int srcH, int srcW, int dstH, int dstW, float scaleH, float scaleW)
 {
@@ -22,7 +22,6 @@ __global__ void kImageUint8Resize_nearest(unsigned char* __restrict__ src, unsig
     dst[dstIdx + 1] = src[srcIdx + 1];
     dst[dstIdx + 2] = src[srcIdx + 2];
 }
-// 最邻近插值，是否保持原高宽比由布尔值isKeepHW决定
 void iImageUint8Resize_nearest(unsigned char* __restrict__ src, unsigned char* __restrict__ dst, 
                   int srcH, int srcW, int dstH, int dstW, bool isKeepHW) 
 {
@@ -60,7 +59,6 @@ __global__ void kImageUint8Resize_nearest_center(const unsigned char* __restrict
 
     if (srcX < 0 || srcX >= srcW || srcY < 0 || srcY >= srcH ) return;
 
-    // 计算像素在目标图上的x,y方向上的偏移量
     gy = gy + offsetY;
     gx = gx + offsetX;
 
@@ -93,7 +91,8 @@ void iImageUint8Resize_nearest_center(unsigned char* __restrict__ src, unsigned 
 
 /* 
 * 最邻近插值，图像保持原高宽比，且居中显示，偏移部分用0 padding
-* 
+* 线程布局以计算能力SMs的数量进行布局且block和grid都是一维的
+* Todo: using 2D <<<gridSize, blockSize>>> to avoid model_operation %
 */
 __global__ void kImageUint8Resize_nearest_center_gridStride_uchar3(const unsigned char* __restrict__ src, unsigned char* __restrict__ dst, 
                     int srcH, int srcW, int dstH, int dstW, float scaleH, float scaleW, int offsetX, int offsetY)
@@ -108,7 +107,7 @@ __global__ void kImageUint8Resize_nearest_center_gridStride_uchar3(const unsigne
 
     for (int i = g_id; i < uc3_pixelLength; i += stride) 
     {
-        int dst_x = i % dstW; // 耗时 (Todo: using 2D <<<gridSize, blockSize>>> to avoid model_operate %)
+        int dst_x = i % dstW; // 耗时 (Todo: using 2D <<<gridSize, blockSize>>> to avoid model_operation %)
         int dst_y = i / dstW;
 
         int src_x = __float2int_rn(static_cast<float>(dst_x) * scaleW);
@@ -116,7 +115,6 @@ __global__ void kImageUint8Resize_nearest_center_gridStride_uchar3(const unsigne
 
         if (src_x < 0 || src_x >= srcW || src_y < 0 || src_y >= srcH ) return;
 
-        // 计算像素在目标图上的x,y方向上的偏移量
         dst_y += offsetY;
         dst_x += offsetX;
 
@@ -149,6 +147,66 @@ void iImageUint8Resize_nearest_center_gridStride_uchar3(unsigned char* __restric
 
     kImageUint8Resize_nearest_center_gridStride_uchar3<<<gridSize, blockSize>>>(src, dst, srcH, srcW, dstH, dstW, scaleH, scaleW, offsetX, offsetY);
 }
+
+
+/* 
+* 最邻近插值，图像保持原高宽比，且居中显示，偏移部分用0 padding
+* 线程布局以计算能力SMs的数量进行布局且block和grid都是二维的
+* 需要注意的是：需要根据不同场景修改线程布局的数量否则会出现不能覆盖所有pixel的情况
+*/
+__global__ void kImageUint8Resize_nearest_center_2DGridStride_uchar3(const unsigned char* __restrict__ src, unsigned char* __restrict__ dst, 
+                    int srcH, int srcW, int dstH, int dstW, float scaleH, float scaleW, int offsetX, int offsetY)
+{
+    const uchar3* uc3_src = reinterpret_cast<const uchar3*>(src);
+    uchar3* uc3_dst = reinterpret_cast<uchar3*>(dst);
+
+    int gid_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int gid_y = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride_x = blockDim.x * gridDim.x;
+    int stride_y = blockDim.y * gridDim.y;
+
+    for (int dst_y = gid_y; dst_y < dstH; dst_y += stride_y) {
+        for (int dst_x = gid_x; dst_x < dstW; dst_x += stride_x) {
+        	int src_x = __float2int_rn(static_cast<float>(dst_x) * scaleW);
+            int src_y = __float2int_rn(static_cast<float>(dst_y) * scaleH);     
+        	
+			if (src_x < 0 || src_x >= srcW || src_y < 0 || src_y >= srcH ) return;
+
+       		dst_y += offsetY;
+        	dst_x += offsetX;
+
+        	uc3_dst[dst_y * dstW + dst_x] = uc3_src[src_y * srcW + src_x];
+        }
+    }
+}
+void iImageUint8Resize_nearest_center_2DGridStride_uchar3(unsigned char* __restrict__ src, unsigned char* __restrict__ dst, 
+                  int srcH, int srcW, int dstH, int dstW) 
+{
+    /*
+    * 线程布局以resized 的图像数据布局为根据。为每一个dstIdx 映射 srcIdx
+    * src_x = dst_x * scale_x
+    * src_y = dst_y * scale_y
+    */ 
+    dim3 blockSize(16, 16);
+    int numSMs;
+    int dev;
+    CHECK(cudaGetDevice(&dev));
+    CHECK(cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, dev));
+    dim3 gridSize(3*numSMs, numSMs); 
+
+    float scaleH = static_cast<float>(srcH) / dstH; 
+    float scaleW = static_cast<float>(srcW) / dstW; 
+    float scale = scaleW > scaleH ? scaleW : scaleH;
+    scaleW = scale;
+    scaleH = scale;
+    
+    int offsetX = int(dstW / 2) - int(srcW / (scaleW * 2));
+    int offsetY = int(dstH / 2) - int(srcH / (scaleH * 2));
+
+    kImageUint8Resize_nearest_center_2DGridStride_uchar3<<<gridSize, blockSize>>>(src, dst, srcH, srcW, dstH, dstW, scaleH, scaleW, offsetX, offsetY);
+}
+
+
 
 // 双线性插值 bilinear interpolation
 __global__ void kImageUint8Resize_bilinear_center(unsigned char* __restrict__ src, unsigned char* __restrict__ dst, 
@@ -266,6 +324,7 @@ int main()
     cv::imwrite("cpu_bilinear.jpg", opencv_dst);
     
     // gpu kernel
+	// nearest: non keep HW rate
     CHECK(cudaMemset(d_dst, 0, dst_bytes));
     total_time = TIME_RECORD(repeat_times, ([&]{iImageUint8Resize_nearest(d_src, d_dst, h_src.rows, h_src.cols, dst_h, dst_w, false);}));
     std::cout << GREEN << std::endl << "[gpu nearest]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
@@ -273,6 +332,7 @@ int main()
     CHECK(cudaMemcpy(h_dst, d_dst, dst_bytes, cudaMemcpyDeviceToHost));
     imageIO::saveBgrUint8(h_dst, dst_w, dst_h, "gpu_nearest_noKeepHW.jpg");
 
+	// nearest: keep HW rate
     CHECK(cudaMemset(d_dst, 0, dst_bytes));
     total_time = TIME_RECORD(repeat_times, ([&]{iImageUint8Resize_nearest(d_src, d_dst, h_src.rows, h_src.cols, dst_h, dst_w, true);}));
     std::cout << GREEN << std::endl << "[gpu nearest keep height:width ]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
@@ -280,6 +340,7 @@ int main()
     CHECK(cudaMemcpy(h_dst, d_dst, dst_bytes, cudaMemcpyDeviceToHost));
     imageIO::saveBgrUint8(h_dst, dst_w, dst_h, "gpu_nearest_keepHW.jpg"); 
 
+	// nearest: center uchar3
     CHECK(cudaMemset(d_dst, 0, dst_bytes));
     total_time = TIME_RECORD(repeat_times, ([&]{iImageUint8Resize_nearest_center(d_src, d_dst, h_src.rows, h_src.cols, dst_h, dst_w);}));
     std::cout << GREEN << std::endl << "[gpu nearest keep_height:width center]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
@@ -287,6 +348,7 @@ int main()
     CHECK(cudaMemcpy(h_dst, d_dst, dst_bytes, cudaMemcpyDeviceToHost));
     imageIO::saveBgrUint8(h_dst, dst_w, dst_h, "gpu_nearest_center.jpg"); 
 
+	// nearest: 1D center gride uchar3
     CHECK(cudaMemset(d_dst, 0, dst_bytes));
     total_time = TIME_RECORD(repeat_times, ([&]{iImageUint8Resize_nearest_center_gridStride_uchar3(d_src, d_dst, h_src.rows, h_src.cols, dst_h, dst_w);}));
     std::cout << GREEN << std::endl << "[gpu nearest keep_height:width center gridStride uchar3]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
@@ -294,6 +356,15 @@ int main()
     CHECK(cudaMemcpy(h_dst, d_dst, dst_bytes, cudaMemcpyDeviceToHost));
     imageIO::saveBgrUint8(h_dst, dst_w, dst_h, "gpu_nearest_center_gridStride_uchar3.jpg"); 
 
+	// nearest: 2D center gride uchar3
+    CHECK(cudaMemset(d_dst, 0, dst_bytes));
+    total_time = TIME_RECORD(repeat_times, ([&]{iImageUint8Resize_nearest_center_2DGridStride_uchar3(d_src, d_dst, h_src.rows, h_src.cols, dst_h, dst_w);}));
+    std::cout << GREEN << std::endl << "[gpu nearest keep_height:width center 2d gridStride uchar3]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(h_dst, 0, dst_bytes);
+    CHECK(cudaMemcpy(h_dst, d_dst, dst_bytes, cudaMemcpyDeviceToHost));
+    imageIO::saveBgrUint8(h_dst, dst_w, dst_h, "gpu_nearest_center_2DGidStride_uchar3.jpg"); 
+
+	// bilinear: center
     CHECK(cudaMemset(d_dst, 0, dst_bytes));
     total_time = TIME_RECORD(repeat_times, ([&]{iImageUint8Resize_bilinear_center(d_src, d_dst, h_src.rows, h_src.cols, dst_h, dst_w);}));
     std::cout << GREEN << std::endl << "[gpu bilinear keep_height:width center]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
