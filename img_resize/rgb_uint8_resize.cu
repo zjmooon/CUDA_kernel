@@ -224,7 +224,7 @@ __global__ void kImageUint8Resize_bilinear_center(unsigned char* __restrict__ sr
     int src_x2 = src_x1 + 1;
 
     // src越界检查
-    if (src_x1 < 0 || src_x1 > srcW || src_y1 < 0 || src_y1 > srcH) return; 
+    if (src_x1 < 0 || src_x1 >= srcW || src_y1 < 0 || src_y1 >= srcH) return; 
 
     // bilinear interpolation -- 计算原图上的坐标(浮点类型)在0~1之间的值
     float th = ((gy + 0.5) * scaleH - 0.5) - src_y1;
