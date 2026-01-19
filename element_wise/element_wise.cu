@@ -106,13 +106,13 @@ __global__ void kVectorAdd_gridStride_Float4(const float* __restrict__ A, const 
 
     for (int i = g_id; i < f4_N; i += stride) 
     {
-        float4 f4_a = f4_A[i]; // 1条指令加载 128 bit
-        float4 f4_b = f4_B[i]; // 1条指令加载 128 bit
+        float4 f4_a = f4_A[i]; // 1条指令加载 128 bit(16 Byte)
+        float4 f4_b = f4_B[i]; // 1条指令加载 128 bit(16 Byte)
 
         C_vec[i] = make_float4(   f4_a.x + f4_b.x, 
                                   f4_a.y + f4_b.y, 
                                   f4_a.z + f4_b.z, 
-                                  f4_a.w + f4_b.w ); // 一条指令写入 128 bit
+                                  f4_a.w + f4_b.w ); // 一条指令写入 128 bit(16 Byte)
     }
         
     /* 
