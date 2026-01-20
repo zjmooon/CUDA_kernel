@@ -107,7 +107,7 @@ __global__ void kImageUint8Resize_nearest_center_gridStride_uchar3(const unsigne
 
     for (int i = g_id; i < uc3_pixelLength; i += stride) 
     {
-        int dst_x = i % dstW; // 耗时 (Todo: using 2D <<<gridSize, blockSize>>> to avoid model_operation %)
+        int dst_x = i % dstW; // 耗时 (Todo: using 2D <<<gridSize, blockSize>>> to avoid model_operation %)。 maybe： dst_x = i & ( dstW - 1 );
         int dst_y = i / dstW;
 
         int src_x = __float2int_rn(static_cast<float>(dst_x) * scaleW);
