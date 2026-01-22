@@ -279,6 +279,159 @@ void iConv2dDirect_N_Tiling(
 
 
 
+// gpu N Tiling with prefetch
+template<const int SHARED_SIZE_W,
+         const int SHARED_SIZE_H, 
+         const int N_TILE,
+         const int CIN>
+__global__ void kConv2dDirect_1x8_Tiling_prefetch(
+    const float* __restrict__ input,   // [Cin][H][W]
+    float* __restrict__ output,        // [Cout][OH][OW]
+    int Cin, int H, int W,
+    int Cout, int KH, int KW,
+    int OH, int OW,
+    int stride, int pad  // stride == 1
+) 
+{
+    __shared__ float s_input[2][SHARED_SIZE_H][SHARED_SIZE_W];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int out_x_0 = blockIdx.x * blockDim.x * N_TILE + tx;
+    const int out_x_1 = out_x_0 + blockDim.x;
+    const int out_x_2 = out_x_1 + blockDim.x;
+    const int out_x_3 = out_x_2 + blockDim.x;
+    const int out_x_4 = out_x_3 + blockDim.x;
+    const int out_x_5 = out_x_4 + blockDim.x;
+    const int out_x_6 = out_x_5 + blockDim.x;
+    const int out_x_7 = out_x_6 + blockDim.x;
+
+    const int out_y = blockIdx.y * blockDim.y + ty;
+    const int out_c = blockIdx.z;
+
+    // if (out_y >= OH || out_c >= Cout) return;  // 会与后续的__syncthreads() 构成死锁
+
+    const int in_start_y = blockIdx.y * blockDim.y - pad;
+    const int in_start_x = blockIdx.x * blockDim.x * N_TILE - pad;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    float sum4 = 0.0f;
+    float sum5 = 0.0f;
+    float sum6 = 0.0f;
+    float sum7 = 0.0f;
+
+    int cur = 0;
+    int next = 1;
+
+    // preftch gmem2smem: c = 0
+    for (int y = ty; y < SHARED_SIZE_H; y += blockDim.y) {
+        int in_y = in_start_y + y;
+        for (int x = tx; x < SHARED_SIZE_W; x += blockDim.x) {
+            int in_x = in_start_x + x;
+            s_input[cur][y][x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ?
+                input[0 * H * W + in_y * W + in_x] : 0.0f; 
+        }
+    }
+    __syncthreads();
+
+
+    for (int c = 0; c < Cin; ++c) {
+        // preftch gmem2smem: next channel
+        if (c + 1 < Cin) {
+            for (int y = ty; y < SHARED_SIZE_H; y += blockDim.y) {
+                int in_y = in_start_y + y;
+                for (int x = tx; x < SHARED_SIZE_W; x += blockDim.x) {
+                    int in_x = in_start_x + x;
+                    s_input[next][y][x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ?
+                        input[(c + 1) * H * W + in_y * W + in_x] : 0.0f; // 填充0
+                }
+            }
+        }
+
+        // preftch compute: current channel
+        #pragma unroll
+        for (int ky = 0; ky < KH; ++ky) {
+            int shared_idx_y = ty + ky;
+            #pragma unroll
+            for (int kx = 0; kx < KW; ++kx) {
+                float f = d_kernel_const[
+                    out_c * Cin * KH * KW +
+                    c * KH * KW +
+                    ky * KW + kx
+                ];
+
+                int shared_x0 = tx + kx;
+
+                float s0 = s_input[cur][shared_idx_y][shared_x0];
+                float s1 = s_input[cur][shared_idx_y][shared_x0 + blockDim.x];
+                float s2 = s_input[cur][shared_idx_y][shared_x0 + blockDim.x * 2];
+                float s3 = s_input[cur][shared_idx_y][shared_x0 + blockDim.x * 3];
+                float s4 = s_input[cur][shared_idx_y][shared_x0 + blockDim.x * 4];
+                float s5 = s_input[cur][shared_idx_y][shared_x0 + blockDim.x * 5];
+                float s6 = s_input[cur][shared_idx_y][shared_x0 + blockDim.x * 6];
+                float s7 = s_input[cur][shared_idx_y][shared_x0 + blockDim.x * 7];
+
+                sum0 += s0 * f;
+                sum1 += s1 * f;
+                sum2 += s2 * f;
+                sum3 += s3 * f;
+                sum4 += s4 * f;
+                sum5 += s5 * f;
+                sum6 += s6 * f;
+                sum7 += s7 * f;
+            }
+        }
+
+        __syncthreads();
+
+        // update cur/next
+        int tmp = cur;
+        cur = next;
+        next = tmp;
+    }
+
+    int base = out_c * OH * OW + out_y * OW;
+    if (out_x_0 < OW) output[base + out_x_0] = sum0;
+    if (out_x_1 < OW) output[base + out_x_1] = sum1;
+    if (out_x_2 < OW) output[base + out_x_2] = sum2;
+    if (out_x_3 < OW) output[base + out_x_3] = sum3;
+    if (out_x_4 < OW) output[base + out_x_4] = sum4;
+    if (out_x_5 < OW) output[base + out_x_5] = sum5;
+    if (out_x_6 < OW) output[base + out_x_6] = sum6;
+    if (out_x_7 < OW) output[base + out_x_7] = sum7;
+
+}
+void iConv2dDirect_1x8_Tiling_prefetch(
+    const float* __restrict__ input,   // [Cin][H][W]
+    /* kernel, */  // [Cout][Cin][KH][KW]
+    float* __restrict__ output,        // [Cout][OH][OW]
+    int Cin, int H, int W,
+    int Cout, int KH, int KW,
+    int OH, int OW,
+    int stride, int pad) 
+{
+    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 grid(
+        CEIL(OW, block.x * NTILING),
+        CEIL(OH, block.y),
+        Cout
+    );
+
+    kConv2dDirect_1x8_Tiling_prefetch<TILE_SHARED_N, TILE_SHARED, NTILING, INPUT_CHANNELS><<<grid, block>>>(
+        input, output,
+        Cin, H, W,
+        Cout, KH, KW,
+        OH, OW,
+        1, pad 
+    );
+
+} 
+
+
 void init_random(std::vector<float>& input, std::vector<float>& kernel, float low = 0.f, float high = 65535.f) {
     std::mt19937 gen(123); // 固定 seed，方便复现
     std::uniform_real_distribution<float> dist(low, high);
@@ -408,7 +561,6 @@ int main() {
     CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);
 
-
     // gpu N Tiling
     CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{
@@ -426,6 +578,25 @@ int main() {
     memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(float));
     CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);
+
+    // gpu N Tiling with prefetch
+    CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(float)));
+    total_time = TIME_RECORD(repeat_times, ([&]{
+        iConv2dDirect_1x8_Tiling_prefetch(
+            d_input,
+            d_output,
+            INPUT_CHANNELS, H, W,
+            OUTPUT_CHANNELS, KH, KW,
+            OH, OW,
+            stride, pad
+        );
+    }));
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
+    " [device 1x" << NTILING << " Tiling with prefetch]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(float));
+    CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);
+
 #endif
 
 #ifdef CUDNN
@@ -517,7 +688,7 @@ int main() {
     cudaEventCreate(&stop);
 
     cudaEventRecord(start);
-    for (int i = 0; i < 100; ++i) {
+    for (int i = 0; i < 10; ++i) {
         CHECK_CUDNN(cudnnConvolutionForward(
             cudnn,
             &alpha,
@@ -533,7 +704,7 @@ int main() {
 
     float ms;
     cudaEventElapsedTime(&ms, start, stop);
-    std::cout << "Avg forward time: " << ms / 100.0f << " ms" << std::endl;
+    std::cout << "Avg forward time: " << ms / 10.0f << " ms" << std::endl;
 
     cudaFree(d_workspace);
 

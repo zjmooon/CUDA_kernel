@@ -1,0 +1,104 @@
+{
+    "extension": "ncu-proj",
+    "files": [
+        {
+            "path": "convolution_ncu1.ncu-rep"
+        },
+        {
+            "is_open": true,
+            "path": "convolution_ncu2.ncu-rep"
+        },
+        {
+            "is_open": true,
+            "path": "convolution_ncu3.ncu-rep"
+        },
+        {
+            "is_open": true,
+            "path": "convolution_ncu4.ncu-rep"
+        },
+        {
+            "is_open": true,
+            "path": "convolution_ncu5.ncu-rep"
+        }
+    ],
+    "launcher": {
+        "activity/interactiveprofile/booststate": "Auto",
+        "activity/interactiveprofile/cachecontrol": "Flush All",
+        "activity/interactiveprofile/clockcontrol": "Base",
+        "activity/interactiveprofile/cpustacksupportoptions": "Native",
+        "activity/interactiveprofile/disableprofilingstartstop": false,
+        "activity/interactiveprofile/enablecpustacksupport": true,
+        "activity/interactiveprofile/enablenvtxsupport": true,
+        "activity/interactiveprofile/enableprofilingfromstart": true,
+        "activity/interactiveprofile/graphprofiling": "Node",
+        "activity/interactiveprofile/importsource": false,
+        "activity/occupancycalculator/file": "",
+        "activity/profile/applyrules": true,
+        "activity/profile/appreplaybuffer": "File",
+        "activity/profile/appreplaymatch": "Grid",
+        "activity/profile/appreplaymode": "Balanced",
+        "activity/profile/booststate": "Auto",
+        "activity/profile/cachecontrol": "Flush All",
+        "activity/profile/checkexitcode": true,
+        "activity/profile/clockcontrol": "Base",
+        "activity/profile/cpustacksupportoptions": "Native",
+        "activity/profile/devices": "",
+        "activity/profile/disableprofilingstartstop": false,
+        "activity/profile/enablecpustacksupport": false,
+        "activity/profile/enablenvtxsupport": false,
+        "activity/profile/enableprofilingfromstart": true,
+        "activity/profile/filtermode": "Global",
+        "activity/profile/forceoverwrite": true,
+        "activity/profile/graphprofiling": "Node",
+        "activity/profile/importsource": false,
+        "activity/profile/kernelid": "",
+        "activity/profile/kernelname": "",
+        "activity/profile/kernelnamebase": "Function",
+        "activity/profile/kill": false,
+        "activity/profile/launchcapturecount": 0,
+        "activity/profile/launchskipbeforematchcount": 0,
+        "activity/profile/launchskipcount": 0,
+        "activity/profile/nvtxincludeexcludeoptions": "",
+        "activity/profile/nvtxpushpopscope": "Thread",
+        "activity/profile/outputfile": "/home/marten/CUDA/CUDA_C_Programming_exercise/CUDA_Kernel/convolution2d_direct/convolution_ncu/convolution_ncu%i",
+        "activity/profile/pmsamplingbuffersize": 0,
+        "activity/profile/pmsamplinginterval": 0,
+        "activity/profile/pmsamplingmaxpasses": 0,
+        "activity/profile/rangefilteroptions": "",
+        "activity/profile/rangereplayoptions": "",
+        "activity/profile/replaymode": "Kernel",
+        "activity/profile/samplingBufferSize": 33554432,
+        "activity/profile/samplingInterval": 5,
+        "activity/profile/samplingIntervalAuto": true,
+        "activity/profile/samplingMaxPasses": 5,
+        "activity/profile/sourcefolders": "",
+        "activity/profile/targetprocesses": "All",
+        "activity/systemtrace/target/command_line": "\"/home/marten/CUDA/CUDA_C_Programming_exercise/CUDA_Kernel/convolution2d_direct/convolution2d_direct_float_cudnn_compare\" ",
+        "activity/systemtrace/target/process_name": "/home/marten/CUDA/CUDA_C_Programming_exercise/CUDA_Kernel/convolution2d_direct/convolution2d_direct_float_cudnn_compare",
+        "activity/systemtrace/target/working_directory": "/home/marten/CUDA/CUDA_C_Programming_exercise/CUDA_Kernel/convolution2d_direct",
+        "platform/armserver/arguments": "",
+        "platform/armserver/environment": "",
+        "platform/armserver/executable": "",
+        "platform/armserver/workingdir": "",
+        "platform/linux (aarch64 sbsa)/device": "",
+        "platform/linux (x86_64)/device": "localhost",
+        "platform/linux/arguments": "",
+        "platform/linux/environment": "",
+        "platform/linux/executable": "/home/marten/CUDA/CUDA_C_Programming_exercise/CUDA_Kernel/convolution2d_direct/convolution2d_direct_float_cudnn_compare",
+        "platform/linux/executable/history": [
+            "/home/marten/CUDA/CUDA_C_Programming_exercise/CUDA_Kernel/convolution2d_direct/convolution2d_direct_float_cudnn_compare",
+            "/home/marten/CUDA/CUDA_C_Programming_exercise/CUDA_Kernel/convolution2d_direct/convolution2d_direct"
+        ],
+        "platform/linux/workingdir": "/home/marten/CUDA/CUDA_C_Programming_exercise/CUDA_Kernel/convolution2d_direct",
+        "platform/linux/workingdir/history": [
+            "/home/marten/CUDA/CUDA_C_Programming_exercise/CUDA_Kernel/convolution2d_direct"
+        ],
+        "platform/win32/arguments": "",
+        "platform/win32/environment": "",
+        "platform/win32/executable": "",
+        "platform/win32/workingdir": "",
+        "platform/windows/device": ""
+    },
+    "uuid": "{f30fb8a2-8074-4cd0-961d-7f3be34e0a69}",
+    "version": "1.0"
+}

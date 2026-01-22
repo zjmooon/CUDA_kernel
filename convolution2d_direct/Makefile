@@ -16,8 +16,8 @@ all: ${CU_APPS}
 %: %.cu
 
 # 	nvcc -arch=sm_$(CUDA_ARCH) -G -g -O0 -o $@ $< -lcudnn -lcuda -lcudadevrt $(OPENCV_INC) $(OPENCV_LIBS) -diag-suppress 611
-	nvcc -arch=sm_$(CUDA_ARCH) -O3 -Xptxas=-v -o $@ $< -lcudnn -lcuda -lcudadevrt $(OPENCV_INC) $(OPENCV_LIBS) -diag-suppress 611
-# 	nvcc $(GENCODE_FLAGS) -o $@ $< -lcudadevrt $(OPENCV_INC) $(OPENCV_LIBS) -diag-suppress 611
+	nvcc -arch=sm_$(CUDA_ARCH) -O3 -Xptxas=-v -lineinfo -o $@ $< -lcudnn -lcuda -lcudadevrt $(OPENCV_INC) $(OPENCV_LIBS) -diag-suppress 611
+# 	nvcc $(GENCODE_FLAGS) -lineinfo -o $@ $< -lcudadevrt $(OPENCV_INC) $(OPENCV_LIBS) -diag-suppress 611
 # -lineinfo
 
 clean:
