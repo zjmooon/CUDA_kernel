@@ -5,7 +5,8 @@
             "includePath": [
                 "${workspaceFolder}/**",
                 "/usr/local/include/opencv4",
-                "/usr/local/include/opencv4/opencv2"
+                "/usr/local/include/opencv4/opencv2",
+                "/usr/local/cuda-12.8/targets/x86_64-linux/include"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/gcc",
