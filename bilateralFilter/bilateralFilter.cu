@@ -27,12 +27,12 @@ __global__ void kConv2dDirect_1x8_Tiling(
     const unsigned short* __restrict__ input,   // [Cin][H][W]
     unsigned short* __restrict__ output,        // [Cout][OH][OW]
     int Cin, int H, int W,
-    int Cout, int KH, int KW,
-    int OH, int OW,
-    float sigma_r // rang space (值域标准差)
+    int Cout, int OH, int OW, 
+    int KH, int KW, float sigma_r // range sigma (值域标准差)
 ) 
 {
     __shared__ unsigned short s_input[SHARED_SIZE_H][SHARED_SIZE_W];
+    float* d_spatial_weights_reg = d_spatial_weights_const;
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
@@ -47,7 +47,7 @@ __global__ void kConv2dDirect_1x8_Tiling(
     const int out_x_7 = out_x_6 + blockDim.x;
 
     const int out_y = blockIdx.y * blockDim.y + ty;
-    const int out_c = blockIdx.z;
+    // const int out_c = blockIdx.z;
 
     // if (out_y >= OH || out_c >= Cout) return;  // 会与后续的__syncthreads() 构成死锁
 
@@ -55,10 +55,10 @@ __global__ void kConv2dDirect_1x8_Tiling(
     const int in_start_x = blockIdx.x * blockDim.x * N_TILE;
     
     // 8个像素的累加器和权重归一化因子
-    float sum0 = 0, sum1 = 0 , sum2 = 0, sum3 = 0, sum4 = 0, sum5 = 0, sum6 = 0, sum7 = 0;
+    float sum0 = 0.0f, sum1 = 0.0f , sum2 = 0.0f, sum3 = 0.0f, sum4 = 0.0f, sum5 = 0.0f, sum6 = 0.0f, sum7 = 0.0f;
     float w_sum0 = 0.0f, w_sum1 = 0.0f, w_sum2 = 0.0f, w_sum3 = 0.0f, 
           w_sum4 = 0.0f, w_sum5 = 0.0f, w_sum6 = 0.0f, w_sum7 = 0.0f;
-    const float inv_rev_sigma2 = -1.0f / (2.0f * sigma_r * sigma_r);
+    const float inv_rev_sigma2 = -0.5f / (sigma_r * sigma_r);
     
     for (int c = 0; c < Cin; c++) {
         // global to shared memory 
@@ -94,7 +94,7 @@ __global__ void kConv2dDirect_1x8_Tiling(
             # pragma unroll
             for (int kx = 0; kx < KW; ++kx) {
                 // 空域权重(预计算查表)
-                float s_weight = d_spatial_weights_const[out_c * Cin * KH * KW +
+                float s_weight = d_spatial_weights_reg[out_c * Cin * KH * KW +
                             c * KH * KW +
                             ky * KW + kx];
 
@@ -111,55 +111,55 @@ __global__ void kConv2dDirect_1x8_Tiling(
                 unsigned short s7 = s_input[shared_idx_y][shared_x0 + blockDim.x * 7];
                 
                 // 值域权重: exp(-|I(p)-I(q)|^2 / 2*sigma_r^2)
-                float diff0 = center_vals0 - s0;
-                float diff1 = center_vals1 - s1;
-                float diff2 = center_vals2 - s2;
-                float diff3 = center_vals3 - s3;      
-                float diff4 = center_vals4 - s4;
-                float diff5 = center_vals5 - s5;
-                float diff6 = center_vals6 - s6;
-                float diff7 = center_vals7 - s7;
+                float diff0 = fabsf(center_vals0 - s0);
+                float diff1 = fabsf(center_vals1 - s1);
+                float diff2 = fabsf(center_vals2 - s2);
+                float diff3 = fabsf(center_vals3 - s3);      
+                float diff4 = fabsf(center_vals4 - s4);
+                float diff5 = fabsf(center_vals5 - s5);
+                float diff6 = fabsf(center_vals6 - s6);
+                float diff7 = fabsf(center_vals7 - s7);
                 
                 // 总权重
                 float r_weight, total_weight;
 
-                r_weight = expf(diff0 * diff0 * inv_rev_sigma2);    
-                total_weight = s_weight * r_weight;    
+                r_weight = __expf(diff0 * diff0 * inv_rev_sigma2);    
+                total_weight = __fmul_rn(s_weight, r_weight);    
                 w_sum0 += total_weight;  
                 sum0 += s0 * total_weight;
 
-                r_weight = expf(diff1 * diff1 * inv_rev_sigma2);    
-                total_weight = s_weight * r_weight;    
+                r_weight = __expf(diff1 * diff1 * inv_rev_sigma2);    
+                total_weight = __fmul_rn(s_weight * r_weight;    
                 w_sum1 += total_weight;  
                 sum1 += s1 * total_weight;
 
-                r_weight = expf(diff2 * diff2 * inv_rev_sigma2);    
-                total_weight = s_weight * r_weight;    
+                r_weight = __expf(diff2 * diff2 * inv_rev_sigma2);    
+                total_weight = __fmul_rn(s_weight, r_weight);    
                 w_sum2 += total_weight;  
                 sum2 += s2 * total_weight;
 
-                r_weight = expf(diff3 * diff3 * inv_rev_sigma2);    
-                total_weight = s_weight * r_weight;    
+                r_weight = __expf(diff3 * diff3 * inv_rev_sigma2);    
+                total_weight = __fmul_rn(s_weight, r_weight);    
                 w_sum3 += total_weight;  
                 sum3 += s3 * total_weight;
 
-                r_weight = expf(diff4 * diff4 * inv_rev_sigma2);    
-                total_weight = s_weight * r_weight;    
+                r_weight = __expf(diff4 * diff4 * inv_rev_sigma2);    
+                total_weight = __fmul_rn(s_weight * r_weight;    
                 w_sum4 += total_weight;  
                 sum4 += s4 * total_weight;
 
-                r_weight = expf(diff5 * diff5 * inv_rev_sigma2);    
-                total_weight = s_weight * r_weight;    
+                r_weight = __expf(diff5 * diff5 * inv_rev_sigma2);    
+                total_weight = __fmul_rn(s_weight, r_weight);    
                 w_sum5 += total_weight;  
                 sum5 += s5 * total_weight;
 
-                r_weight = expf(diff6 * diff6 * inv_rev_sigma2);    
-                total_weight = s_weight * r_weight;    
+                r_weight = __expf(diff6 * diff6 * inv_rev_sigma2);    
+                total_weight = __fmul_rn(s_weight, r_weight);    
                 w_sum6 += total_weight;  
                 sum6 += s6 * total_weight;
 
-                r_weight = expf(diff7 * diff7 * inv_rev_sigma2);    
-                total_weight = s_weight * r_weight;    
+                r_weight = __expf(diff7 * diff7 * inv_rev_sigma2);    
+                total_weight = __fmul_rn(s_weight, r_weight);    
                 w_sum7 += total_weight;  
                 sum7 += s7 * total_weight;
 
@@ -182,27 +182,25 @@ __global__ void kConv2dDirect_1x8_Tiling(
 
 void iConv2dDirect_8_Tiling(
     const unsigned short* __restrict__ input,   // [Cin][H][W]
-    /* kernel, */  // [Cout][Cin][KH][KW]
     unsigned short* __restrict__ output,        // [Cout][OH][OW]
     int Cin, int H, int W,
-    int Cout, int KH, int KW,
-    int OH, int OW,
-    float valSigma) 
+    int Cout, int OH, int OW,
+    int KH, int KW, float valSigma) 
 {
-    dim3 block(16, 16);
+    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
     dim3 grid(CEIL(OW, block.x * 8), CEIL(OH, block.y), Cout);
 
     kConv2dDirect_1x8_Tiling<TILE_SHARED_8, TILE_SHARED, 8, 1><<<grid, block>>>(
         input, output,
         Cin, H, W,
-        Cout, KH, KW,
-        OH, OW,
-        valSigma
+        Cout, OH, OW,
+        KH, KW, valSigma
     );
 } 
 
 void generateSpatialWeight(int nRadius, float nPosSquareSigma, float* h_spatial_weights) {
     int size = 2 * nRadius + 1;
+    float normalization = 0.0f;
     
     float twoSigmaSquare = 2.0f * nPosSquareSigma; // NPP 传入的通常已经是 sigma^2
     
@@ -211,9 +209,16 @@ void generateSpatialWeight(int nRadius, float nPosSquareSigma, float* h_spatial_
             float distanceSq = static_cast<float>(x * x + y * y);
             // 计算高斯分布
             float weight = std::exp(-distanceSq / twoSigmaSquare);
+            normalization += weight;
             
             // 映射到数组索引 [0, 2*nRadius]
             h_spatial_weights[(y + nRadius) * size + (x + nRadius)] = weight;
+        }
+    }
+
+    for (int y = -nRadius; y <= nRadius; ++y) {
+        for (int x = -nRadius; x <= nRadius; ++x) {
+            h_spatial_weights[(y + nRadius) * size + (x + nRadius)] /= normalization;
         }
     }
 }
@@ -227,13 +232,17 @@ int main() {
     height = img.rows;
 
     size_t imgSize = width * height * sizeof(unsigned short);
+    // 计算卷积后输出尺寸
+    int OH = (height - KERNEL_SIZE) + 1;
+    int OW = (width - KERNEL_SIZE) + 1;
 
     // alloc GPU memory
     unsigned short* d_src_16u;
     unsigned short* d_dst_16u;
+    unsigned short* d_dst_16u_kernel;
     CHECK(cudaMalloc(reinterpret_cast<void **>(&d_src_16u), height * width * sizeof(unsigned short)));
     CHECK(cudaMalloc(reinterpret_cast<void **>(&d_dst_16u), height * width * sizeof(unsigned short)));
-    
+    CHECK(cudaMalloc(reinterpret_cast<void **>(&d_dst_16u_kernel), OH * OW * sizeof(unsigned short)));
     // host -> device
     cudaMemcpy(d_src_16u, img.data, imgSize, cudaMemcpyHostToDevice);
 
@@ -270,37 +279,34 @@ int main() {
     {
         int repeat_times = 10;
         float total_time;
-        // 计算卷积后输出尺寸
-        int OH = (height - KERNEL_SIZE) + 1;
-        int OW = (width - KERNEL_SIZE) + 1;
 
         float* h_spatial_weights = (float*)malloc(KERNEL_SIZE * KERNEL_SIZE * sizeof(float)); 
         generateSpatialWeight(RADIUS, posSigma * posSigma, h_spatial_weights);
         cudaMemcpyToSymbol(d_spatial_weights_const, h_spatial_weights, KERNEL_SIZE * KERNEL_SIZE * sizeof(float));
         // gpu N Tiling
-        CHECK(cudaMemset(d_dst_16u, 0, height * width * sizeof(unsigned short)));
+        CHECK(cudaMemset(d_dst_16u_kernel, 0, OH * OW * sizeof(unsigned short)));
         total_time = TIME_RECORD(repeat_times, ([&]{
             iConv2dDirect_8_Tiling(
                 d_src_16u,
-                d_dst_16u,
+                d_dst_16u_kernel,
                 1, height, width,
-                1, KERNEL_SIZE, KERNEL_SIZE,
-                OH, OW, valSigma
+                1, OH, OW,
+                KERNEL_SIZE, KERNEL_SIZE, valSigma
             );
         }));
         std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
         " [device 1x8" << " Tiling]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
         
-        std::vector<unsigned short> output(height * width);
-        cudaMemcpy(output.data(), d_dst_16u, imgSize, cudaMemcpyDeviceToHost);
-        CHECK(cudaMemcpy(output.data(), d_dst_16u, OH * OW * sizeof(unsigned short), cudaMemcpyDeviceToHost));
+        std::vector<unsigned short> output(OH * OW);
+        CHECK(cudaMemcpy(output.data(), cudaFree(d_dst_16u);, OH * OW * sizeof(unsigned short), cudaMemcpyDeviceToHost));
         cv::Mat outImg16u(height, width, CV_16UC1, output.data());
-        cv::imwrite("asset/moon_3840_2160_bilateraled_tile_16u.tif", outImg16u);
+        cv::imwrite("asset/moon_" + std::to_string(OW) + "_" + std::to_string(OH) + "_kernel_bilateraled_16u.tif", outImg16u);
     }
  
     // free GPU memory
     cudaFree(d_src_16u);
     cudaFree(d_dst_16u);
+    cudaFree(cudaFree(d_dst_16u););
 
     std::cout << "Done!\n";
     return 0;
