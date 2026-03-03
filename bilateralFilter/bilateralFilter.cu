@@ -124,6 +124,7 @@ __global__ void kConv2dDirect_1x8_Tiling(
                 // 总权重
                 float r_weight, total_weight;
 
+                // TODO： LUT precomputation 
                 r_weight = __expf(diff0 * diff0 * inv_rev_sigma2);    
                 total_weight = __fmul_rn(s_weight, r_weight);    
                 w_sum0 += total_weight;  
