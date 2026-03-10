@@ -181,7 +181,8 @@ void iSoftmax_WarpReduce_fusion(const float *input, float *output, int N) {
 * softmax(xi) = exp(xi - M) / exp(xi - M).sum()
 * 以行为单位做softmax
 */ 
-__global__ void kSgemv_softmax(const float* __restrict__ input, float* __restrict__ output, int M, int N) 
+__global__ 
+void kSgemv_softmax(const float* __restrict__ input, float* __restrict__ output, int M, int N) 
 {
     const int tx = threadIdx.x;
     const int bx = blockIdx.x;
@@ -230,6 +231,74 @@ void iSgemv_softmax(const float* __restrict__ input, float* __restrict__ output,
     int gridSize(M); // 每个block负责一行.每个 Block 只有一个线程束(Warp).在处理列数K较小的矩阵时非常高效
 
     kSgemv_softmax<<<gridSize, blockSize>>>(input, output, M, N);
+}
+
+/*
+* softmax(xi) = exp(xi - M) / exp(xi - M).sum()
+* flash attention中常用的online softmax版本，在线计算max和sum，减少内存访问
+*/ 
+__global__
+void kOnline_softmax(const float* __restrict__ input, float* __restrict__ output,    
+                    const int seq_len, const int dim_per_head, const int Bc, const int Br,
+                    float* l, float *m) {
+    int tx = threadIdx.x;
+    int bx = blockIdx.x; int by = blockIdx.y;  // batch and head index
+
+    // Offset l,m - different for each batch and head
+    int lm_offset = (bx * gridDim.y * seq_len) + (by * seq_len);  // offset for l and m
+
+    for (int i = 0; i < CEIL(seq_len, Bc); i++) {
+
+        float row_m_prev = m[lm_offset + (Br * i) + tx];
+        float row_l_prev = l[lm_offset + (Br * i) + tx];
+
+        float row_m = -INFINITY;
+        for (int y = 0; y < Bc; y++) {
+            for (int x = 0; x < dim_per_head; x++) {
+                row_m = (input[(tx * dim_per_head) + x] > row_m) ? input[(tx * dim_per_head) + x] : row_m;
+            }
+        }
+
+        // P = exp(S - row_m), row_l = rowsum(P)
+        float row_l = 0;
+        for (int y = 0; y < Bc; y++) {
+            row_l += __expf(input[(tx * dim_per_head) + y] - row_m);
+        }
+
+        // Compute new m and l
+        float row_m_new = max(row_m_prev, row_m);
+        float row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + (__expf(row_m - row_m_new) * row_l);
+
+        // Write O, l, m to HBM
+        for (int x = 0; x < dim_per_head; x++) {
+            for (int y = 0; y < Bc; y++) {
+                pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
+            }
+            O[qkv_offset + (tile_size * i) + (tx * d) + x] = (1 / row_l_new) \
+                * ((row_l_prev * __expf(row_m_prev - row_m_new) * O[qkv_offset + (tile_size * i) + (tx * d) + x]) \
+                + (__expf(row_m - row_m_new) * pv));
+        }
+        m[lm_offset + (Br * i) + tx] = row_m_new;
+        l[lm_offset + (Br * i) + tx] = row_l_new;
+    }
+}
+void iOnline_softmax(const float* __restrict__ input, float* __restrict__ output, 
+    int Batch=1, int num_heads=1, int seq_len=1, int dim_per_head) {
+    // 如果总维度是 512，num_heads = 8，那么每个头分到的维度 dim_per_head = 512 / 8 = 64
+    
+    int Bc = 32, Br = 32;
+    
+    dim3 grid_dim(Batch, num_heads);  // batch_size x num_heads
+    dim3 block_dim(Bc);  // Bc threads per block
+    float *l = nullptr, *m = nullptr;
+    int lm_size = Batch * num_heads * seq_len * sizeof(float);  // size for l and m
+    cudaMalloc(reinterpret_cast<void **>(&l), lm_size);
+    cudaMalloc(reinterpret_cast<void **>(&m), lm_size);
+    cudaMemset(l, 0, lm_size);
+    cudaMemset(m, 0, lm_size);
+    
+    kOnline_softmax<<<grid_dim, block_dim>>>(input, output, seq_len, dim_per_head, Bc, Br, l, m);
+
 }
 
 
@@ -327,16 +396,21 @@ int main(int argc, char **argv)
 
     // gpu sgemv-like softmax
     CHECK(cudaMemset(d_dst, 0, bytes));
-    total_time = TIME_RECORD(repeat_times, ([&]{iSgemv_softmax(d_src, d_dst, 1, size);}));
+    total_time = TIME_RECORD(repeat_times, ([&]{iSgemv_softmax(d_src, d_dst, 1, size);})); // 以行为单位做softmax，因此M=1
     std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
     " [device sgemv softmax]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(kernel_dst, 0, bytes);
     CHECK(cudaMemcpy(kernel_dst, d_dst, bytes, cudaMemcpyDeviceToHost));
     verifyResult(h_dst, kernel_dst, size, 1e-3);  
 
-    // TODO:
-    // gou online_softmax
-
+    // gpu online_softmax
+    CHECK(cudaMemset(d_dst, 0, bytes));
+    total_time = TIME_RECORD(repeat_times, ([&]{iOnline_softmax(d_src, d_dst, 1, size);})); // 以行为单位做softmax，因此M=1
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
+    " [device online softmax]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(kernel_dst, 0, bytes);
+    CHECK(cudaMemcpy(kernel_dst, d_dst, bytes, cudaMemcpyDeviceToHost));
+    verifyResult(h_dst, kernel_dst, size, 1e-3);  
     
     free(h_src);
     free(h_dst);
