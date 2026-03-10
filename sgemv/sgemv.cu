@@ -5,6 +5,7 @@
 #include <cmath>
 
 // SGEMV: Single-precision General Matrix-Vector multiplication
+// 一个warp处理一行的数据，并归约到一个thread中，线程布局需要 <<<num_rows, warpSize>>>
 // matrix_src: M * K; vector_src: K * 1; vector_dst: M * 1
 
 __global__ void kSgemv_try(const float* __restrict__ matrix_src, const float* __restrict__ vector_src, 
@@ -16,11 +17,11 @@ __global__ void kSgemv_try(const float* __restrict__ matrix_src, const float* __
 
     float accum = 0.0f;
     // 每个线程做部分和
-    for (int i = tx; i < K; i += warpSize) {
+    for (int i = tx; i < K; i += warpSize) { // 合并访问
         accum += matrix_src[bx * K + i] * vector_src[i];
     }
 
-    // warp 内归约
+    // warp 内归约 （上一步已经将部分和聚集到线程束线程中）
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
         accum += __shfl_down_sync(0xFFFFFFFF, accum, offset);
     }
