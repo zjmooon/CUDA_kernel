@@ -316,7 +316,7 @@ int main(int argc, char **argv)
     CHECK(cudaMemcpy(kernel_dst, d_dst, bytes, cudaMemcpyDeviceToHost));
     verifyResult(h_dst, kernel_dst, size, 1e-3);  
 
-    // gpu fusion version
+    // gpu fusion version (further verification is needed)
     CHECK(cudaMemset(d_dst, 0, bytes));
     total_time = TIME_RECORD(repeat_times, ([&]{iSoftmax_WarpReduce_fusion(d_src, d_dst, size);}));
     std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
@@ -325,7 +325,7 @@ int main(int argc, char **argv)
     CHECK(cudaMemcpy(kernel_dst, d_dst, bytes, cudaMemcpyDeviceToHost));
     verifyResult(h_dst, kernel_dst, size, 1e-3);  
 
-    // gpu sgemv softmax
+    // gpu sgemv-like softmax
     CHECK(cudaMemset(d_dst, 0, bytes));
     total_time = TIME_RECORD(repeat_times, ([&]{iSgemv_softmax(d_src, d_dst, 1, size);}));
     std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
@@ -333,6 +333,9 @@ int main(int argc, char **argv)
     memset(kernel_dst, 0, bytes);
     CHECK(cudaMemcpy(kernel_dst, d_dst, bytes, cudaMemcpyDeviceToHost));
     verifyResult(h_dst, kernel_dst, size, 1e-3);  
+
+    // TODO:
+    // gou online_softmax
 
     
     free(h_src);
