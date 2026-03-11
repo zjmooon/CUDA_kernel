@@ -73,7 +73,7 @@ void iSgemv_ref(const float* __restrict__ matrix_src, const float* __restrict__ 
 * 以行为单位做softmax
 * 验证见reduce_softmax.cu
 */ 
-__global__ void kSgemv_softmax(const float* __restrict__ input, float* __restrict__ output, int M, int N) 
+__global__ void kSgemv_softmax(const float* __restrict__ input, float* __restrict__ output, int x_num) 
 {
     const int tx = threadIdx.x;
     const int bx = blockIdx.x;
@@ -84,8 +84,8 @@ __global__ void kSgemv_softmax(const float* __restrict__ input, float* __restric
     // max
     // 先求出每个线程负责数据的max_val
     float max_val = -FLT_MAX;
-    for (int i = tx; i < N; i += warpSize) {
-        max_val = fmaxf(input[bx * N + i], max_val);
+    for (int i = tx; i < x_num; i += warpSize) {
+        max_val = fmaxf(input[bx * x_num + i], max_val);
     }
     // warp内归约求出每行最大值
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
@@ -98,9 +98,9 @@ __global__ void kSgemv_softmax(const float* __restrict__ input, float* __restric
 
     // sum
     float sum_val = 0.0f;
-    for (int i = tx; i < N; i += warpSize) {
-        /* sum_val += expf(input[bx * N + i] - max_val_shared); */
-        sum_val += expf(input[bx * N + i] - max_val);
+    for (int i = tx; i < x_num; i += warpSize) {
+        /* sum_val += expf(input[bx * x_num + i] - max_val_shared); */
+        sum_val += expf(input[bx * x_num + i] - max_val);
     }
 
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
@@ -112,16 +112,16 @@ __global__ void kSgemv_softmax(const float* __restrict__ input, float* __restric
     } */
 
     // 对一行数据的所有数据做softmax
-    for (int i = tx; i < N; i += warpSize) {
-        output[bx * N + i] = expf(input[bx * N + i] - max_val) / sum_val;
+    for (int i = tx; i < x_num; i += warpSize) {
+        output[bx * x_num + i] = expf(input[bx * x_num + i] - max_val) / sum_val;
     }
 
 }
-void iSgemv_softmax(const float* __restrict__ input, float* __restrict__ output, int M, int N) {
+void iSgemv_softmax(const float* __restrict__ input, float* __restrict__ output, int y_num, int x_num) {
     int blockSize(32); // block的大小设置为warpSize
-    int gridSize(M); // 每个block负责一行.每个 Block 只有一个线程束(Warp).在处理列数K较小的矩阵时非常高效
+    int gridSize(y_num); // 每个block负责一行.每个 Block 只有一个线程束(Warp).在处理列数K较小的矩阵时非常高效
 
-    kSgemv_softmax<<<gridSize, blockSize>>>(input, output, M, N);
+    kSgemv_softmax<<<gridSize, blockSize>>>(input, output, x_num);
 }
 
 

@@ -182,7 +182,7 @@ void iSoftmax_WarpReduce_fusion(const float *input, float *output, int N) {
 * 以行为单位做softmax
 */ 
 __global__ 
-void kSgemv_softmax(const float* __restrict__ input, float* __restrict__ output, int M, int N) 
+void kSgemv_softmax(const float* __restrict__ input, float* __restrict__ output, int x_num) 
 {
     const int tx = threadIdx.x;
     const int bx = blockIdx.x;
@@ -193,8 +193,8 @@ void kSgemv_softmax(const float* __restrict__ input, float* __restrict__ output,
     // max
     // 先求出每个线程负责数据的max_val
     float max_val = -FLT_MAX;
-    for (int i = tx; i < N; i += warpSize) {
-        max_val = fmaxf(input[bx * N + i], max_val);
+    for (int i = tx; i < x_num; i += warpSize) {
+        max_val = fmaxf(input[bx * x_num + i], max_val);
     }
     // warp内归约求出每行最大值
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
@@ -207,9 +207,9 @@ void kSgemv_softmax(const float* __restrict__ input, float* __restrict__ output,
 
     // sum
     float sum_val = 0.0f;
-    for (int i = tx; i < N; i += warpSize) {
-        /* sum_val += expf(input[bx * N + i] - max_val_shared); */
-        sum_val += expf(input[bx * N + i] - max_val);
+    for (int i = tx; i < x_num; i += warpSize) {
+        /* sum_val += expf(input[bx * x_num + i] - max_val_shared); */
+        sum_val += expf(input[bx * x_num + i] - max_val);
     }
 
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
@@ -221,23 +221,23 @@ void kSgemv_softmax(const float* __restrict__ input, float* __restrict__ output,
     } */
 
     // 对一行数据的所有数据做softmax
-    for (int i = tx; i < N; i += warpSize) {
-        output[bx * N + i] = expf(input[bx * N + i] - max_val) / sum_val;
+    for (int i = tx; i < x_num; i += warpSize) {
+        output[bx * x_num + i] = expf(input[bx * x_num + i] - max_val) / sum_val;
     }
 
 }
-void iSgemv_softmax(const float* __restrict__ input, float* __restrict__ output, int M, int N) {
+void iSgemv_softmax(const float* __restrict__ input, float* __restrict__ output, int y_num, int x_num) {
     int blockSize(32); // block的大小设置为warpSize
-    int gridSize(M); // 每个block负责一行.每个 Block 只有一个线程束(Warp).在处理列数K较小的矩阵时非常高效
+    int gridSize(y_num); // 每个block负责一行.每个 Block 只有一个线程束(Warp).在处理列数K较小的矩阵时非常高效
 
-    kSgemv_softmax<<<gridSize, blockSize>>>(input, output, M, N);
+    kSgemv_softmax<<<gridSize, blockSize>>>(input, output, x_num);
 }
 
 /*
 * softmax(xi) = exp(xi - M) / exp(xi - M).sum()
 * flash attention中常用的online softmax版本，在线计算max和sum，减少内存访问
 */ 
-__global__
+/* __global__
 void kOnline_softmax(const float* __restrict__ input, float* __restrict__ output,    
                     const int seq_len, const int dim_per_head, const int Bc, const int Br,
                     float* l, float *m) {
@@ -300,7 +300,7 @@ void iOnline_softmax(const float* __restrict__ input, float* __restrict__ output
     kOnline_softmax<<<grid_dim, block_dim>>>(input, output, seq_len, dim_per_head, Bc, Br, l, m);
 
 }
-
+ */
 
 
 void verifyResult(const float* host, const float* kernel, size_t size, double eps = 1e-3)
@@ -398,19 +398,19 @@ int main(int argc, char **argv)
     CHECK(cudaMemset(d_dst, 0, bytes));
     total_time = TIME_RECORD(repeat_times, ([&]{iSgemv_softmax(d_src, d_dst, 1, size);})); // 以行为单位做softmax，因此M=1
     std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
-    " [device sgemv softmax]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    " [device sgemv-like softmax]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(kernel_dst, 0, bytes);
     CHECK(cudaMemcpy(kernel_dst, d_dst, bytes, cudaMemcpyDeviceToHost));
     verifyResult(h_dst, kernel_dst, size, 1e-3);  
 
     // gpu online_softmax
-    CHECK(cudaMemset(d_dst, 0, bytes));
+/*     CHECK(cudaMemset(d_dst, 0, bytes));
     total_time = TIME_RECORD(repeat_times, ([&]{iOnline_softmax(d_src, d_dst, 1, size);})); // 以行为单位做softmax，因此M=1
     std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
     " [device online softmax]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(kernel_dst, 0, bytes);
     CHECK(cudaMemcpy(kernel_dst, d_dst, bytes, cudaMemcpyDeviceToHost));
-    verifyResult(h_dst, kernel_dst, size, 1e-3);  
+    verifyResult(h_dst, kernel_dst, size, 1e-3);   */
     
     free(h_src);
     free(h_dst);
