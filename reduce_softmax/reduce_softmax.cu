@@ -236,71 +236,71 @@ void iSgemv_softmax(const float* __restrict__ input, float* __restrict__ output,
 /*
 * softmax(xi) = exp(xi - M) / exp(xi - M).sum()
 * flash attention中常用的online softmax版本，在线计算max和sum，减少内存访问
+* https://zhuanlan.zhihu.com/p/5078640012
 */ 
-/* __global__
+__global__
 void kOnline_softmax(const float* __restrict__ input, float* __restrict__ output,    
-                    const int seq_len, const int dim_per_head, const int Bc, const int Br,
-                    float* l, float *m) {
+                    const int num_rows, const int num_cols, int Bc) 
+{
+    int row_idx = blockIdx.x;
     int tx = threadIdx.x;
-    int bx = blockIdx.x; int by = blockIdx.y;  // batch and head index
+    if (row_idx >= num_rows) return;
 
-    // Offset l,m - different for each batch and head
-    int lm_offset = (bx * gridDim.y * seq_len) + (by * seq_len);  // offset for l and m
+    int row_offset = row_idx * num_cols;
 
-    for (int i = 0; i < CEIL(seq_len, Bc); i++) {
+    float row_m_prev = -INFINITY;
+    float row_l_prev = 0.0f;
 
-        float row_m_prev = m[lm_offset + (Br * i) + tx];
-        float row_l_prev = l[lm_offset + (Br * i) + tx];
+    // 将每行划分为多个块，每个块包含 Bc 列
+    int num_chunks = CEIL(num_cols, Bc);
 
-        float row_m = -INFINITY;
-        for (int y = 0; y < Bc; y++) {
-            for (int x = 0; x < dim_per_head; x++) {
-                row_m = (input[(tx * dim_per_head) + x] > row_m) ? input[(tx * dim_per_head) + x] : row_m;
-            }
+    // Phase 1: Online Reduction (流式分块计算最终的 m 和 l)
+    for (int j = 0; j < num_chunks; j++) {
+        int start_col = j * Bc;
+        int end_col = min(start_col + Bc, num_cols);
+
+        float local_m = -INFINITY;
+        float local_l = 0.0f;
+
+        // 1. 计算当前块的最大值
+        #pragma unroll
+        for (int col = start_col; col < end_col; col++) {
+            local_m = fmaxf(local_m, input[row_offset + col]);
+        }
+        // 2. 更新行最大值
+        float row_m_new = fmaxf(row_m_prev, local_m);
+
+        // 3. 计算当前块的局部指数和
+        #pragma unroll
+        for (int col = start_col; col < end_col; col++) {
+            local_l += __expf(input[row_offset + col] - row_m_new);
         }
 
-        // P = exp(S - row_m), row_l = rowsum(P)
-        float row_l = 0;
-        for (int y = 0; y < Bc; y++) {
-            row_l += __expf(input[(tx * dim_per_head) + y] - row_m);
-        }
+        // 4. 更新行指数和(根据新旧最大值的差，缩放旧的指数和，并加上当前块的指数和)
+        float row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + local_l;
 
-        // Compute new m and l
-        float row_m_new = max(row_m_prev, row_m);
-        float row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + (__expf(row_m - row_m_new) * row_l);
+        // 5. 更新全局的 m 和 l
+        row_m_prev = row_m_new;
+        row_l_prev = row_l_new;
+    }
+    /* // 如果后续需要反向传播，需要将每行的最终 m 和 l 保存下来，供后续使用
+    if (m_out != nullptr) m_out[row_idx] = row_m_prev;
+    if (l_out != nullptr) l_out[row_idx] = row_l_prev; */
 
-        // Write O, l, m to HBM
-        for (int x = 0; x < dim_per_head; x++) {
-            for (int y = 0; y < Bc; y++) {
-                pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
-            }
-            O[qkv_offset + (tile_size * i) + (tx * d) + x] = (1 / row_l_new) \
-                * ((row_l_prev * __expf(row_m_prev - row_m_new) * O[qkv_offset + (tile_size * i) + (tx * d) + x]) \
-                + (__expf(row_m - row_m_new) * pv));
-        }
-        m[lm_offset + (Br * i) + tx] = row_m_new;
-        l[lm_offset + (Br * i) + tx] = row_l_new;
+    // Phase 2: 生成最终的 Softmax 概率矩阵, flash attention的精妙之处在于不需要显式地进行这一步骤
+    #pragma unroll
+    for (int col = tx; col < num_cols; col += blockDim.x) {
+        output[row_offset + col] = __expf(input[row_offset + col] - row_m_prev) / row_l_prev;
     }
 }
-void iOnline_softmax(const float* __restrict__ input, float* __restrict__ output, 
-    int Batch=1, int num_heads=1, int seq_len=1, int dim_per_head) {
-    // 如果总维度是 512，num_heads = 8，那么每个头分到的维度 dim_per_head = 512 / 8 = 64
+void iOnline_softmax(const float* __restrict__ input, float* __restrict__ output, int num_rows, int num_cols) {
+   
+    dim3 blockSize(256);
+    dim3 gridSize(num_rows); 
     
-    int Bc = 32, Br = 32;
-    
-    dim3 grid_dim(Batch, num_heads);  // batch_size x num_heads
-    dim3 block_dim(Bc);  // Bc threads per block
-    float *l = nullptr, *m = nullptr;
-    int lm_size = Batch * num_heads * seq_len * sizeof(float);  // size for l and m
-    cudaMalloc(reinterpret_cast<void **>(&l), lm_size);
-    cudaMalloc(reinterpret_cast<void **>(&m), lm_size);
-    cudaMemset(l, 0, lm_size);
-    cudaMemset(m, 0, lm_size);
-    
-    kOnline_softmax<<<grid_dim, block_dim>>>(input, output, seq_len, dim_per_head, Bc, Br, l, m);
-
+    kOnline_softmax<<<gridSize, blockSize>>>(input, output, num_rows, num_cols, 32);
 }
- */
+
 
 
 void verifyResult(const float* host, const float* kernel, size_t size, double eps = 1e-3)
@@ -396,7 +396,7 @@ int main(int argc, char **argv)
 
     // gpu sgemv-like softmax
     CHECK(cudaMemset(d_dst, 0, bytes));
-    total_time = TIME_RECORD(repeat_times, ([&]{iSgemv_softmax(d_src, d_dst, 1, size);})); // 以行为单位做softmax，因此M=1
+    total_time = TIME_RECORD(repeat_times, ([&]{iSgemv_softmax(d_src, d_dst, 1, size);})); // 以行为单位做softmax，为便于验证，令行数为1，列数为size
     std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
     " [device sgemv-like softmax]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(kernel_dst, 0, bytes);
@@ -404,13 +404,13 @@ int main(int argc, char **argv)
     verifyResult(h_dst, kernel_dst, size, 1e-3);  
 
     // gpu online_softmax
-/*     CHECK(cudaMemset(d_dst, 0, bytes));
-    total_time = TIME_RECORD(repeat_times, ([&]{iOnline_softmax(d_src, d_dst, 1, size);})); // 以行为单位做softmax，因此M=1
+    CHECK(cudaMemset(d_dst, 0, bytes));
+    total_time = TIME_RECORD(repeat_times, ([&]{iOnline_softmax(d_src, d_dst, 1, size);})); // 以行为单位做softmax，为便于验证，令行数为1，列数为size
     std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
     " [device online softmax]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(kernel_dst, 0, bytes);
     CHECK(cudaMemcpy(kernel_dst, d_dst, bytes, cudaMemcpyDeviceToHost));
-    verifyResult(h_dst, kernel_dst, size, 1e-3);   */
+    verifyResult(h_dst, kernel_dst, size, 1e-3);  
     
     free(h_src);
     free(h_dst);
