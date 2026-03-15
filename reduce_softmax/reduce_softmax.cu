@@ -254,7 +254,8 @@ void kOnline_softmax(const float* __restrict__ input, float* __restrict__ output
     // 将每行划分为多个块，每个块包含 Bc 列
     int num_chunks = CEIL(num_cols, Bc);
 
-    // Phase 1: Online Reduction (流式分块计算最终的 m 和 l)
+    // 以下的设计方式并没有做到合并访存，主要是为了复现流式计算的思路   TODO: 合并访存优化
+    // Phase 1: Online Reduction (流式分块计算最终的 m 和 l)    
     for (int j = 0; j < num_chunks; j++) {
         int start_col = j * Bc;
         int end_col = min(start_col + Bc, num_cols);
@@ -293,14 +294,63 @@ void kOnline_softmax(const float* __restrict__ input, float* __restrict__ output
         output[row_offset + col] = __expf(input[row_offset + col] - row_m_prev) / row_l_prev;
     }
 }
-void iOnline_softmax(const float* __restrict__ input, float* __restrict__ output, int num_rows, int num_cols) {
+void iOnline_softmax(const float* __restrict__ input, float* __restrict__ output, int num_rows, int num_cols, int Bc) {
    
-    dim3 blockSize(256);
-    dim3 gridSize(num_rows); 
+    dim3 blockSize(1);
+    dim3 gridSize(num_rows); // 每个block负责一行
     
-    kOnline_softmax<<<gridSize, blockSize>>>(input, output, num_rows, num_cols, 32);
+    kOnline_softmax<<<gridSize, blockSize>>>(input, output, num_rows, num_cols, Bc);
 }
 
+
+/*
+* softmax(xi) = exp(xi - M) / exp(xi - M).sum()
+* 以行为单位做softmax
+*/ 
+__global__ 
+void kSgemv_online_softmax(const float* __restrict__ input, float* __restrict__ output, int num_cols) 
+{
+    const int tx = threadIdx.x;
+    const int bx = blockIdx.x;
+
+    // 先求出每个线程负责数据的max和sum
+    float m = -FLT_MAX;
+    float l = 0.0f;
+
+    for (int i = tx; i < num_cols; i += warpSize) {
+        float max_prev = m;
+        float cur_input = input[bx * num_cols + i];
+        m = fmaxf(cur_input, max_prev);
+        l = __expf(max_prev - m) * l + __expf(cur_input - m);
+    }
+
+    // 分块流式得到一行的max和sum
+    // warp内归约
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        float max_offset = __shfl_xor_sync(0XFFFFFFFF, m, offset);
+        float l_offset = __shfl_xor_sync(0XFFFFFFFF, l, offset);
+        float max_new = fmaxf(m, max_offset);
+        
+        l = __expf(m - max_new) * l + __expf(max_offset - max_new) * l_offset;
+        m = max_new;
+    } 
+
+    /* // 如果后续需要反向传播，需要将每行的最终 m 和 l 保存下来，供后续使用
+    if (m_out != nullptr) m_out[row_idx] = m;
+    if (l_out != nullptr) l_out[row_idx] = l; */
+
+    // 对一行数据的所有数据做softmax
+    for (int i = tx; i < num_cols; i += warpSize) {
+        output[bx * num_cols + i] = expf(input[bx * num_cols + i] - m) / l;
+    }
+
+}
+void iSgemv_online_softmax(const float* __restrict__ input, float* __restrict__ output, int num_rows, int num_cols) {
+    int blockSize(32); // block的大小设置为warpSize
+    int gridSize(num_rows); // 每个block负责一行.每个 Block 只有一个线程束(Warp)
+
+    kSgemv_online_softmax<<<gridSize, blockSize>>>(input, output, num_cols);
+}
 
 
 void verifyResult(const float* host, const float* kernel, size_t size, double eps = 1e-3)
@@ -351,7 +401,7 @@ int main(int argc, char **argv)
 {
     int repeat_times = 10;
     double iStart, iElaps;
-    int size = 1 << 7;
+    int size = 1 << 9;
     float total_time;
 
     size_t bytes = size * sizeof(float);
@@ -385,14 +435,14 @@ int main(int argc, char **argv)
     CHECK(cudaMemcpy(kernel_dst, d_dst, bytes, cudaMemcpyDeviceToHost));
     verifyResult(h_dst, kernel_dst, size, 1e-3);  
 
-    // gpu fusion version (further verification is needed)
+/*     // gpu fusion version (further verification is needed)
     CHECK(cudaMemset(d_dst, 0, bytes));
     total_time = TIME_RECORD(repeat_times, ([&]{iSoftmax_WarpReduce_fusion(d_src, d_dst, size);}));
     std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
     " [device warp reduce fusion]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(kernel_dst, 0, bytes);
     CHECK(cudaMemcpy(kernel_dst, d_dst, bytes, cudaMemcpyDeviceToHost));
-    verifyResult(h_dst, kernel_dst, size, 1e-3);  
+    verifyResult(h_dst, kernel_dst, size, 1e-3);   */
 
     // gpu sgemv-like softmax
     CHECK(cudaMemset(d_dst, 0, bytes));
@@ -405,12 +455,22 @@ int main(int argc, char **argv)
 
     // gpu online_softmax
     CHECK(cudaMemset(d_dst, 0, bytes));
-    total_time = TIME_RECORD(repeat_times, ([&]{iOnline_softmax(d_src, d_dst, 1, size);})); // 以行为单位做softmax，为便于验证，令行数为1，列数为size
+    total_time = TIME_RECORD(repeat_times, ([&]{iOnline_softmax(d_src, d_dst, 1, size, 32);})); // 以行为单位做softmax，为便于验证，令行数为1，列数为size，分块大小为32
     std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
     " [device online softmax]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(kernel_dst, 0, bytes);
     CHECK(cudaMemcpy(kernel_dst, d_dst, bytes, cudaMemcpyDeviceToHost));
     verifyResult(h_dst, kernel_dst, size, 1e-3);  
+    
+    // gpu sgemv-like online_softmax
+    CHECK(cudaMemset(d_dst, 0, bytes));
+    total_time = TIME_RECORD(repeat_times, ([&]{iSgemv_online_softmax(d_src, d_dst, 1, size);})); // 以行为单位做softmax，为便于验证，令行数为1，列数为size
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
+    " [device sgemv-like online softmax]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(kernel_dst, 0, bytes);
+    CHECK(cudaMemcpy(kernel_dst, d_dst, bytes, cudaMemcpyDeviceToHost));
+    verifyResult(h_dst, kernel_dst, size, 1e-3);  
+    
     
     free(h_src);
     free(h_dst);
