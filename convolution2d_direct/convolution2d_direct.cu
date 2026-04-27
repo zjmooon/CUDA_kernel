@@ -45,29 +45,30 @@ void conv2d_direct_cpu(
 
     memset(output, 0, sizeof(int) * Cout * OH * OW);
 
-    for (int oc = 0; oc < Cout; ++oc) {
-        for (int oh = 0; oh < OH; ++oh) {
-            for (int ow = 0; ow < OW; ++ow) {
+    for (int out_c = 0; out_c < Cout; ++out_c) {
+        for (int out_y = 0; out_y < OH; ++out_y) {
+            for (int out_x = 0; out_x < OW; ++out_x) {
                 int sum = 0;
                 for (int c = 0; c < Cin; ++c) {
                     for (int ky = 0; ky < KH; ++ky) {
                         for (int kx = 0; kx < KW; ++kx) {
-                            int in_y = oh * stride + ky - pad; // 计算输入特征图的y轴索引
-                            int in_x = ow * stride + kx - pad; // x轴索引
+                            int in_y = out_y * stride + ky - pad; // 计算输入特征图的y轴索引
+                            int in_x = out_x * stride + kx - pad; // x轴索引
 
                             if (in_y >= 0 && in_y < H && in_x >= 0 && in_x < W) {
                                 int in_idx = c * H * W + in_y * W + in_x;
-                                int k_idx = oc * Cin * KH * KW + c * KH * KW + ky * KW + kx;
+                                int k_idx = out_c * Cin * KH * KW + c * KH * KW + ky * KW + kx;
 
                                 sum += input[in_idx] * kernel[k_idx];
                             }
                         }
                     }
                 }
-                output[oc * OH * OW + oh * OW + ow] = sum;
+                output[out_c * OH * OW + out_y * OW + out_x] = sum;
             }
         }
     }
+
 }
 
 
