@@ -38,7 +38,8 @@ void conv2d_direct_cpu(
     int Cin, int H, int W,
     int Cout, int KH, int KW,
     int stride, int pad
-) {
+) 
+{
     int OH = (H + 2 * pad - KH) / stride + 1;
     int OW = (W + 2 * pad - KW) / stride + 1;
 
@@ -111,6 +112,7 @@ __global__ void kConv2dDirect_naive(
                         c * KH * KW +
                         ky * KW + kx;
 
+                    // 如果想有尽可能高的性能，可以将常量内存d_kernel_const搬运到register
                     sum += input[in_idx] * d_kernel_const[k_idx];
                 }
             }
@@ -776,7 +778,8 @@ void init_random_input(std::vector<int>& input, int low = 0, int high = 65535){
 }
 
 
-void init_random_kernel(std::vector<int>& kernel, int low = -10, int high = 10) {
+void init_random_kernel(std::vector<int>& kernel, int low = -10, int high = 10) 
+{
     static std::mt19937 gen(123); // 固定 seed，但序列不会重复
     std::uniform_int_distribution<int> dist(low, high);
 
