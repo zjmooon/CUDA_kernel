@@ -216,7 +216,7 @@ __global__ void kConv2dDirect_blocked(
         /* // 1_2: 2D to 1D 
         # pragma unroll
         for (int i = ty * blockDim.x + tx; i < SHARED_SIZE * SHARED_SIZE; i += blockDim.x * blockDim.y) {
-            int x = i % SHARED_SIZE;
+            int x = i % SHARED_SIZE; // i % (2^n)  ==  i & (2^n - 1)，当除数是2的整数次幂时，可以用&替代%运算，性能更好
             int y = i / SHARED_SIZE;
 
             int in_x = in_start_x + x;
