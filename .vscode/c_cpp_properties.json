@@ -6,7 +6,9 @@
                 "${workspaceFolder}/**",
                 "/usr/local/include/opencv4",
                 "/usr/local/include/opencv4/opencv2",
-                "/usr/local/cuda-12.8/targets/x86_64-linux/include"
+                "/usr/local/cuda-12.8/targets/x86_64-linux/include",
+                "/opt/libtorch/include/",
+                "/opt/libtorch/include/torch/csrc/api/include"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/gcc",
