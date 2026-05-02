@@ -111,7 +111,6 @@ void iSgemmBlockTiled(int M, int N, int K,
  */
 
 
-template <int TILE_DIM>
 __global__ void kSgemmBlockTiled(int M, int N, int K,
                         const float* __restrict__ A, int lda,
                         const float* __restrict__ B, int ldb,
@@ -120,41 +119,43 @@ __global__ void kSgemmBlockTiled(int M, int N, int K,
     const int gx = threadIdx.x + blockDim.x * blockIdx.x; 
     const int gy = threadIdx.y + blockDim.y * blockIdx.y; 
 
-    if (gx >= N || gy >= M) return;
+    // if (gx >= N || gy >= M) return; // 避免与后续__syncthreads构成死锁
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
 
-    __shared__ float As[TILE_DIM][TILE_DIM];
-    __shared__ float Bs[TILE_DIM][TILE_DIM];
-    /* __shared__ float As[TILE_DIM * TILE_DIM];
-    __shared__ float Bs[TILE_DIM * TILE_DIM]; */
+    __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
+    /* __shared__ float As[BLOCK_SIZE * BLOCK_SIZE];
+    __shared__ float Bs[BLOCK_SIZE * BLOCK_SIZE]; */
 
-    A = &A[lda * TILE_DIM * blockIdx.y];
-    B = &B[TILE_DIM * blockIdx.x];
+    A = &A[lda * BLOCK_SIZE * blockIdx.y];
+    B = &B[BLOCK_SIZE * blockIdx.x];
     float acc = 0.0f;
 
     # pragma unroll
-    for (int k = 0; k < K; k += TILE_DIM) {
-        As[ty][tx] = A[ty * lda + tx];
-        Bs[ty][tx] = B[ty * ldb + tx];
-        /* As[ty * TILE_DIM + tx] = A[ty * lda + tx];
-        Bs[ty * TILE_DIM + tx] = B[ty * ldb + tx];  */      
+    for (int k = 0; k < K; k += BLOCK_SIZE) { 
+        As[ty][tx] = A[ty * lda + tx]; // 对于全局内存:合并访存； 对于共享内存:没有Bank conflict
+        Bs[ty][tx] = B[ty * ldb + tx]; // 合并访存:连续线程访问连续全局内存地址； Bank conflict:同一warp的不同线程访问统一Bank的不同地址
+        /* As[ty * BLOCK_SIZE + tx] = A[ty * lda + tx];
+        Bs[ty * BLOCK_SIZE + tx] = B[ty * ldb + tx];  */      
         __syncthreads();
 
-        A += TILE_DIM;
-        B += TILE_DIM * ldb;
+        A += BLOCK_SIZE;
+        B += BLOCK_SIZE * ldb;
 
         # pragma unroll
-        for (int k_inner = 0; k_inner < TILE_DIM; k_inner++) {
+        for (int k_inner = 0; k_inner < BLOCK_SIZE; k_inner++) {
             acc += As[ty][k_inner] * Bs[k_inner][tx];
+            // As load触发广播机制，无Bank conflict： 对于tx 0~31，ty为常数，k_inner也为常数。
+            // 所以As[ty][k_inner]在同一warp中被多个线程访问，但它们访问的是同一地址，触发广播机制，性能较好。
             // Bs load不存在Bank conflict
-            // acc += As[ty * TILE_DIM + k_inner] * Bs[k_inner * TILE_DIM + tx];
+            // acc += As[ty * BLOCK_SIZE + k_inner] * Bs[k_inner * BLOCK_SIZE + tx];
         }
         __syncthreads();
     }
 
-    C = &C[ldc * TILE_DIM * blockIdx.y + TILE_DIM * blockIdx.x];
+    C = &C[ldc * BLOCK_SIZE * blockIdx.y + BLOCK_SIZE * blockIdx.x];
     C[ty * ldc + tx] = acc;   // 不是 C[gy * ldc + gx] = acc, 因为C首地址已经移动到局部了
 }
 void iSgemmBlockTiled(int M, int N, int K,
@@ -165,7 +166,7 @@ void iSgemmBlockTiled(int M, int N, int K,
     dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
     dim3 gridSize(CEIL(N, BLOCK_SIZE), CEIL(M, BLOCK_SIZE));
 
-    kSgemmBlockTiled<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
+    kSgemmBlockTiled<<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
 
@@ -244,7 +245,7 @@ void iSgemmBlockTiled_float4(int M, int N, int K,
     dim3 blockSize(CEIL(BLOCK_SIZE, 4), BLOCK_SIZE); // (8, 32)，适应float4的线程布局
     dim3 gridSize(CEIL(N, BLOCK_SIZE), CEIL(M, BLOCK_SIZE));
 
-    kSgemmBlockTiled_float4<32><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
+    kSgemmBlockTiled_float4<BLOCK_SIZE><<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
 
