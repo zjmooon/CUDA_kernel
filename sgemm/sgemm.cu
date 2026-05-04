@@ -116,8 +116,8 @@ __global__ void kSgemmBlockTiled(int M, int N, int K,
                         const float* __restrict__ B, int ldb,
                         float* C, int ldc) 
 {
-    const int gx = threadIdx.x + blockDim.x * blockIdx.x; 
-    const int gy = threadIdx.y + blockDim.y * blockIdx.y; 
+    // const int gx = threadIdx.x + blockDim.x * blockIdx.x; 
+    // const int gy = threadIdx.y + blockDim.y * blockIdx.y; 
 
     // if (gx >= N || gy >= M) return; // 避免与后续__syncthreads构成死锁
 
@@ -167,9 +167,140 @@ void iSgemmBlockTiled(int M, int N, int K,
     dim3 gridSize(CEIL(N, BLOCK_SIZE), CEIL(M, BLOCK_SIZE));
 
     kSgemmBlockTiled<<<gridSize, blockSize>>>(M, N, K, A, lda, B, ldb, C, ldc);
+} // shared memory 访问次数： M*N * (K / BLOCK_SIZE * (2 + 2*BLOCK_SIZE))
+
+template <int TILE>
+__global__ void kSgemmShared(int M, int N, int K, 
+    const float* __restrict__ A, const float* __restrict__ B, float*  C)
+{
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+    const int BM = TILE;
+    const int BN = TILE;
+    const int BK = TILE;
+
+    __shared__ float As[BM][BK];
+    __shared__ float Bs[BK][BN];
+
+    A = &A[K * by * BM];
+    B = &B[bx * BN];
+    C = &C[N * by * BM + bx * BN];
+    float acc = 0;
+
+    for (int k=0; k<K; k+=BK) {
+        As[ty][tx] = A[ty * K + tx];
+        Bs[ty][tx] = B[ty * N + tx];
+        __syncthreads();
+
+        A += BK;
+        B += BK * N;
+        
+        #pragma unroll
+        for (int k_inner = 0; k_inner < BK; k_inner++) {
+            acc += As[ty][k_inner] * Bs[k_inner][tx];
+        }
+        __syncthreads();
+    }
+    C[ty * N + tx] = acc;
+}
+
+void iSgemmShared(int M, int N, int K, 
+    const float* __restrict__ A, const float* __restrict__ B, float*  C)
+{
+    dim3 blockSize(32, 32);
+    dim3 gridSize(CEIL(N, blockSize.x), CEIL(M, blockSize.y));
+
+    kSgemmShared<32><<<gridSize, blockSize>>>(M, N, K, A, B, C);
+
 }
 
 
+
+template <int BM, int BN, int BK, int TM, int TN>
+__global__ void kSgemmThread(int M, int N, int K, 
+    const float* __restrict__ A, const float* __restrict__ B, float*  C)
+{
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+
+    __shared__ float As[BM][BK];
+    __shared__ float Bs[BK][BN];
+
+    const int thread_y_per_block = BM / TM;
+    const int thread_x_per_block = BN / TN;
+    const int thread_nums = thread_x_per_block * thread_y_per_block;
+
+    const int tty = (threadIdx.x / thread_x_per_block) * TM;
+    const int ttx = (threadIdx.x % thread_x_per_block) * TN;
+
+    const int a_x = threadIdx.x % BK;
+    const int a_y = threadIdx.x / BK;
+    const int a_tile_stride = thread_nums / BK;
+
+    const int b_x = threadIdx.x % BN;
+    const int b_y = threadIdx.x / BN;
+    const int b_tile_stride = thread_nums / BN;
+
+    A = &A[K * by * BM];
+    B = &B[bx * BN];
+    C = &C[N * by * BM + bx * BN];
+
+    float acc[TM][TN] = {0.0f, 0.0f};
+
+    for (int k = 0; k < K; k += BK) {
+        #pragma unroll
+        for (int i = 0; i < BM; i += a_tile_stride) {
+            As[a_y + i][a_x] = A[(a_y + i) * K + a_x];
+        }
+        #pragma unroll
+        for (int i = 0; i < BK; i += b_tile_stride) {
+            Bs[b_y + i][b_x] = B[(b_y + i) * N + b_x];
+        }
+        __syncthreads();
+        
+        A += BK;
+        B += BK * N;
+
+        // shared memory -> register
+        for (int k_inner = 0; k_inner < BK; k_inner++) {
+            float a_reg[TM], b_reg[TN];
+            for (int m = 0; m < TM; m++) a_reg[m] = As[tty + m][k_inner];
+            for (int n = 0; n < TN; n++) b_reg[n] = Bs[k_inner][ttx + n];
+
+            for (int m = 0; m < TM; m++) {
+                for (int n = 0; n < TN; n++) {
+                    acc[m][n] += a_reg[m] * b_reg[n];
+                }
+            }
+        }
+        __syncthreads();
+
+    }
+
+    #pragma unroll
+    for (int m = 0; m < TM; m++) {
+        #pragma unroll
+        for (int n = 0; n < TN; n++) {
+            #pragma unroll
+            for (int k_inner = 0; k_inner < BK; k_inner++) {
+                C[(tty + m) * N + (ttx + n)] = acc[m][n];
+            }
+        }
+    }
+
+}
+
+void iSgemmThread(int M, int N, int K, 
+    const float* __restrict__ A, const float* __restrict__ B, float*  C)
+{
+    dim3 blockSize(256);
+    dim3 gridSize(CEIL(N, 128), CEIL(M, 128));
+
+    kSgemmThread<128, 128, 8, 8, 8><<<gridSize, blockSize>>>(M, N, K, A, B, C);
+
+}
 /* 
 * 在block tile的基础上使用float4向量化优化。
 * Using vectorized loads reduces the total number of instructions, reduces latency, and improves bandwidth utilization.
@@ -364,11 +495,11 @@ __global__ void kSgemmThreadTiled_ref(const float* __restrict__ A, const float* 
     int thread_num = block_dim_x * block_dim_y;  // block中thread总量 (16*16=256)  blockDim.x
 
     // (threadTile操作(线程操作更多数据)，加倍Mul, 后续时填充+(0~Mul-1))
-    int tx = (threadIdx.x % block_dim_x) * TN;  // threadtile左上角x坐标 ((0~255) % 16) * 8 --> (0~15) * 8 --> (0,8,16,...,120)  
-    int ty = (threadIdx.x / block_dim_x) * TM;  // threadtile左上角y坐标 ((0~255) / 16) * 8 --> (0~15) * 8 --> (0,8,16,...,120)  
+    int ttx = (threadIdx.x % block_dim_x) * TN;  // threadtile左上角x坐标 ((0~255) % 16) * 8 --> (0~15) * 8 --> (0,8,16,...,120)  
+    int tty = (threadIdx.x / block_dim_x) * TM;  // threadtile左上角y坐标 ((0~255) / 16) * 8 --> (0~15) * 8 --> (0,8,16,...,120)  
 
-    __shared__ float As[BM][BK];
-    __shared__ float Bs[BK][BN];
+    __shared__ float As[BM][BK]; //[128][8]
+    __shared__ float Bs[BK][BN]; 
 
     A = &A[by * BM * K];
     B = &B[bx * BN];
@@ -377,16 +508,16 @@ __global__ void kSgemmThreadTiled_ref(const float* __restrict__ A, const float* 
     // 从global memory搬运到shared memory
     // 可以不利用threadTile操作，所以设计成一个线程搬运少数数据：BM/a_tile_stride(与TM*TN比较)
     // 手动计算线程在As中的x，y方向坐标
-    int a_tile_y = threadIdx.x / BK;
-    int a_tile_x = threadIdx.x % BK;
+    int a_tile_y = threadIdx.x / BK; // (0~255) / 8 --> (0~31)
+    int a_tile_x = threadIdx.x % BK; // % 8 --> (0~7) int a_tile_x = threadIdx.x & (BK - 1); Bk是2的整数次幂
     // 目前为止，已经将线程映射到了 As 矩阵的上方一部分区域。如果线程不够多，它们只能覆盖矩阵的上半截。
-    int a_tile_stride = thread_num / BK; 
-    // threadIdx.x,thread_num是线程布局变量，BK是数据布局变量。
+    int a_tile_stride = thread_num / BK; // 256/8=32 
+    // threadIdx.x, thread_num是线程布局变量，BK是数据布局变量。
     // thread_num是线程布局变量block thread总量，BK是数据布局变量As矩阵的一行有多少列。
     // 物理意义：a_tile_stride是block所有线程一次性总共能搬运多少行。 
 
     int b_tile_y = threadIdx.x / BN; // 以block thread为单位划分Bs数据
-    int b_tile_x = threadIdx.x % BN;
+    int b_tile_x = threadIdx.x % BN; // int b_tile_x = threadIdx.x & (BN - 1); BN是2的整数次幂
     int b_tile_stride = thread_num / BN; // threadIdx.x,thread_num是线程布局变量，BN是数据布局变量
 
     float accum[TM][TN] = {0.0f};
@@ -411,45 +542,43 @@ __global__ void kSgemmThreadTiled_ref(const float* __restrict__ A, const float* 
         B += BK * N;
 
         /* 
-        // 内积，效率比较低。访问TM*TN*2次shared_memory
+        // 访问TM*TN*BK*2次shared_memory
         #pragma unroll
         for (int y = 0; y < TM; y++) {
             #pragma unroll
             for (int x = 0; x < TN; x++) {
                 #pragma unroll
                 for (int k_inner = 0; k_inner < BK; k_inner++) {
-                    // tx,ty:(0,8,16,...,120)
+                    // ttx,tty:(0,8,16,...,120)
                     // y,x:(0~7)
-                    // 对于线程[ty，tx]，它计算C中TM*TN个数据
+                    // 对于线程[tty，ttx]，它计算C中TM*TN个数据
                     // 对于As、Bs, 每一个数据的计算需要As的一行与Bs的一列(A一行的部分和B一列的部分)
-                    // 计算一个accum[y][x]要访问As、Bs各TM*TN次，可以搬运shared memory数据到register memory中提高访问速度
-                    accum[y][x] += As[ty + y][k_inner] * Bs[k_inner][tx + x];
+                    // 计算一个accum[y][x]要访问As、Bs各TM*TN次，可以搬运shared memory数据到register中提高访问速度
+                    accum[y][x] += As[tty + y][k_inner] * Bs[k_inner][ttx + x];
                 }
             }
-        } */
+        } 
+        */
 
-        // 外积，效率好。访问TM+TN次shared_memory 
+        // shared memory -> register。访问TM+TN次shared_memory 
         #pragma unroll
         for (int k_inner = 0; k_inner < BK; k_inner++) {
             // 搬运shared memory数据到register memory中提高访问速度
             // As的一列的TM个数据 As[[BM][BK]
             // BM%TM==0
             #pragma unroll
-            for (int y = 0; y < TM; y++) {
-                a_reg[y] = As[ty + y][k_inner];
-            }
+            for (int y = 0; y < TM; y++) a_reg[y] = As[tty + y][k_inner];
             // Bs的一行的TN个数据 Bs[BK][BN]
             #pragma unroll
-            for (int x = 0; x < TN; x++) {
-                b_reg[x] = Bs[k_inner][tx + x];
-            }
+            for (int x = 0; x < TN; x++) b_reg[x] = Bs[k_inner][ttx + x];
+            
             #pragma unroll
             for (int y = 0; y < TM; y++) {
                 #pragma unroll
                 for (int x = 0; x < TN; x++)
                     accum[y][x] += a_reg[y] * b_reg[x];
             }
-        }
+        } // shared memory 访问次数： M*N/(TM*TN) * (K / BK * (8 + (8 + 8))*8))
        
         __syncthreads();
     }
@@ -459,7 +588,7 @@ __global__ void kSgemmThreadTiled_ref(const float* __restrict__ A, const float* 
     for (int y = 0; y < TM; y++) {
         #pragma unroll
         for (int x = 0; x < TN; x++) {
-            C[(ty + y) * N + (tx + x)] = accum[y][x];
+            C[(tty + y) * N + (ttx + x)] = accum[y][x];
         }
     }
 }
@@ -505,10 +634,12 @@ __global__ void kSgemmThreadTiled_ref_2d(const float* __restrict__ A, const floa
     // 从global memory搬运到shared memory
     // 可以不利用threadTile操作，所以设计成一个线程搬运少数数据：BM/a_tile_stride(与TM*TN比较)
     int a_tile_y = tid / BK;
-    int a_tile_x = tid % BK;
+    // int a_tile_x = tid % BK;
+    int a_tile_x = tid & (BK - 1);
     int a_tile_stride = thread_num / BK;
     int b_tile_y = tid / BN;
-    int b_tile_x = tid % BN;
+    // int b_tile_x = tid % BN;
+    int b_tile_x = tid & (BN - 1);
     int b_tile_stride = thread_num / BN;
 
     float accum[TM][TN] = {0.0f};
@@ -533,7 +664,7 @@ __global__ void kSgemmThreadTiled_ref_2d(const float* __restrict__ A, const floa
         B += BK * N;
         
         /* 
-        // 内积，效率比较低。访问TM*TN*2次shared_memory
+        // 访问TM*TN*BK*2次shared_memory。
         for (int row = 0; row < TM; row++) {
             for (int col = 0; col < TN; col++) {
                 for (int i = 0; i < BK; i++) {
@@ -547,7 +678,7 @@ __global__ void kSgemmThreadTiled_ref_2d(const float* __restrict__ A, const floa
             }
         } */
 
-        // 外积，效率好。访问TM+TN次shared_memory 
+        // shared memory -> register。访问TM+TN次shared_memory 
         #pragma unroll
         for (int k_inner = 0; k_inner < BK; k_inner++) {
             // 搬运shared memory数据到register memory中提高访问速度
@@ -664,7 +795,7 @@ __global__ void kSgemmThreadTiled_float4_noTranspose(const float* __restrict__ A
         B += BK * N;
 
         
-        // 外积，效率好。访问shared_memory TM+TN次 
+        // shared memory -> register。访问shared_memory TM+TN次 
         #pragma unroll
         for (int k_inner = 0; k_inner < BK; k_inner++) {
             // 搬运shared memory数据到register memory中提高访问速度
@@ -689,7 +820,7 @@ __global__ void kSgemmThreadTiled_float4_noTranspose(const float* __restrict__ A
             }    
         }
 
-        /* // 内积，效率比较低。访问shared_memoryTM*TN*2次
+        /* // 访问TM*TN*BK*2次shared_memory
         #pragma unroll
         for (int k_inner = 0; k_inner < BK; k_inner++) {
             #pragma unroll
@@ -1364,6 +1495,14 @@ int main(int argc, char** argv)
     memset(kernel_C, 0, sizeC * sizeof(float));
     CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(hC, kernel_C, M * N, 1e-3);  
+    
+    CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
+    total_time = TIME_RECORD(repeat_times, ([&]{iSgemmShared(M, N, K, dA, dB, dC);}));
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
+    " [device block tile test]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(kernel_C, 0, sizeC * sizeof(float));
+    CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(hC, kernel_C, M * N, 1e-3);  
 
     CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{iSgemmBlockTiled_float4(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
@@ -1395,6 +1534,15 @@ int main(int argc, char** argv)
     memset(kernel_C, 0, sizeC * sizeof(float));
     CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(hC, kernel_C, M * N, 1e-3);  
+    
+    CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
+    total_time = TIME_RECORD(repeat_times, ([&]{iSgemmThread(M, N, K, dA, dB, dC);}));
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
+    " [device thread tile test]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(kernel_C, 0, sizeC * sizeof(float));
+    CHECK(cudaMemcpy(kernel_C, dC, sizeC * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(hC, kernel_C, M * N, 1e-3);  
+
 
     CHECK(cudaMemset(dC, 0, sizeC * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{iSgemmThreadTiled_ref_2d(M, N, K, dA, lda, dB, ldb, dC, ldc);}));
