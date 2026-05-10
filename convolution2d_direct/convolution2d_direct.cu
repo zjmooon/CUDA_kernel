@@ -280,6 +280,115 @@ void iConv2dDirect_blocked(
     );
 } 
 
+template<int BM, int BN, int TM, int TN, int KH, int KW, int S_H, int S_W>
+__global__ void kConv2dThread_blocked(
+    const int* __restrict__ input,   // [Cin][H][W]
+    int* __restrict__ output,        // [Cout][OH][OW]
+    int Cin, int H, int W,
+    int Cout, int OH, int OW,
+    int stride, int pad
+) 
+{
+    __shared__ int s_input[S_H][S_W];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int bx = blockIdx.x; 
+    const int by = blockIdx.y; 
+    const int out_c = blockIdx.z; 
+
+    const int out_start_y = by * BM;
+    const int out_start_x = bx * BN;
+    const int in_start_y = out_start_y * STRIDE - pad;
+    const int in_start_x = out_start_x * STRIDE - pad;
+
+    int acc[TM][TN] = {0.0f};
+
+    const int tid = ty * blockDim.x + tx;
+    const int num_threads = blockDim.x * blockDim.y;
+
+    for (int c = 0; c < Cin; c++) {
+        // global -> shared memory
+        #pragma unroll
+        for (int i = tid; i < S_H * S_W; i += num_threads) {
+            int s_y = i / S_W;
+            int s_x = i % S_W;
+            int in_y = in_start_y + s_y;
+            int in_x = in_start_x + s_x;
+            
+            s_input[s_y][s_x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
+                input[c * H * W + in_y * W + in_x] : 0; // 越界补0
+        }
+        __syncthreads();
+
+        // thread 
+        #pragma unroll
+        for (int ky = 0; ky < KH; ++ky) {
+            #pragma unroll
+            for (int kx = 0; kx < KW; ++kx) {
+                int k_idx = out_c * Cin * KH * KW + c * KH * KW + ky * KW + kx;
+    
+                #pragma unroll
+                for (int m = 0; m < TM; ++m) {
+                    #pragma unroll
+                    for (int n = 0; n < TN; ++n) {
+                        int out_y_local = ty * TM + m;
+                        int out_x_local = tx * TN + n;
+
+                        int shared_y = out_y_local * STRIDE + ky;
+                        int shared_x = out_x_local * STRIDE + kx;
+
+                        acc[m][n] += s_input[shared_y][shared_x] * d_kernel_const[k_idx];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // write back
+    #pragma unroll
+    for (int m = 0; m < TM; ++m) {
+        #pragma unroll
+        for (int n = 0; n < TN; ++n) {
+            int global_out_y = out_start_y + ty * TM + m;
+            int global_out_x = out_start_x + tx * TN + n;
+
+            if (global_out_y < OH && global_out_x < OW) {
+                output[out_c * OH * OW + global_out_y * OW + global_out_x] = acc[m][n];
+            }
+        }
+    }
+}
+void iConv2dThread_blocked(
+    const int* __restrict__ input,   
+    int* __restrict__ output,        
+    int Cin, int H, int W,
+    int Cout, int KH, int KW,
+    int OH, int OW,
+    int stride, int pad ) 
+{
+    const int TM = 4; 
+    const int TN = 4; 
+    
+    dim3 block(16, 16); 
+    
+    const int BM = block.y * TM; // 16 * 4 = 64
+    const int BN = block.x * TN; // 16 * 4 = 64
+
+    dim3 grid(CEIL(OW, BN), CEIL(OH, BM), Cout);
+
+    const int S_H = (BM - 1) * stride + KH; // 64 + 7 - 1 = 70
+    const int S_W = (BN - 1) * stride + KW; // 64 + 7 - 1 = 70
+
+    // <int BM, int BN, int TM, int TN, int KH, int KW, int S_H, int S_W>
+    kConv2dThread_blocked<64, 64, 4, 4, KERNEL_SIZE, KERNEL_SIZE, 70, 70><<<grid, block>>>(
+        input, output,
+        Cin, H, W,
+        Cout, OH, OW,
+        stride, pad
+    );
+}
 
 /*
 * kConv2dDirect_blocked版本其实是将核函数从memory-bound 转换为 compute-bound 问题
@@ -919,7 +1028,25 @@ int main() {
     " [device blocked]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(int));
     CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(int), cudaMemcpyDeviceToHost));
-    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);
+    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);  
+    
+    // gpu thread
+    CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(int)));
+    total_time = TIME_RECORD(repeat_times, ([&]{
+        iConv2dThread_blocked(
+            d_input,
+            d_output,
+            INPUT_CHANNELS, H, W,
+            OUTPUT_CHANNELS, KH, KW,
+            OH, OW,
+            stride, pad
+        );
+    }));
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
+    " [device thread]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(int));
+    CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(int), cudaMemcpyDeviceToHost));
+    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);  
 
     // gpu N Tiling
     CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(int)));

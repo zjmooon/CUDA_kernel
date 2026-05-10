@@ -83,6 +83,8 @@ __global__ void kConv2dDirect_naive(
     int in_start_y = out_y * stride - pad; // 计算输入特征图的y轴索引base
     int in_start_x = out_x * stride - pad; // x轴索引base
 
+    float* reg_kernel = d_kernel_const;
+
     # pragma unroll
     for (int c = 0; c < Cin; ++c) {
         # pragma unroll
@@ -100,7 +102,7 @@ __global__ void kConv2dDirect_naive(
                         c * KH * KW +
                         ky * KW + kx;
 
-                    sum += input[in_idx] * d_kernel_const[k_idx];
+                    sum += input[in_idx] * reg_kernel[k_idx];
                 }
             }
         }
@@ -117,7 +119,12 @@ void iConv2dDirect_naive(
     int OH, int OW,
     int stride, int pad ) 
 {
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    // int blockSize;    
+    // int minGridSize;
+    // cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, (void*)kConv2dDirect_naive, 0, 0);
+    // std::cout << "minGridSize: " << minGridSize << " blockSize:" << blockSize << std::endl;
+
+    dim3 block(BLOCK_SIZE * 2, BLOCK_SIZE);
     dim3 grid(
         CEIL(OW, block.x),
         CEIL(OH, block.y),
@@ -133,7 +140,102 @@ void iConv2dDirect_naive(
     );
 }
 
+// gpu shared memory optimized / block tile
+// https://github.com/eunomia-bpf/basic-cuda-tutorial/blob/main/06-cnn-convolution.cu
+template<const int SHARED_SIZE, const int CIN = INPUT_CHANNELS>
+__global__ void kConv2dDirect_shared(
+    const float* __restrict__ input,   // [Cin][H][W]
+    float* __restrict__ output,        // [Cout][OH][OW]
+    int Cin, int H, int W,
+    int Cout, int KH, int KW,
+    int OH, int OW,
+    int stride, int pad
+) 
+{
+    __shared__ float s_input[SHARED_SIZE][SHARED_SIZE];
 
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int out_x = blockIdx.x * blockDim.x + tx;
+    const int out_y = blockIdx.y * blockDim.y + ty;
+    const int out_c = blockIdx.z;
+    
+    // if (out_x >= OW || out_y >= OH) return;  // 会与后续的__syncthreads() 构成死锁
+    
+    const int in_start_y = blockIdx.y * blockDim.y * stride - pad; // 计算输入特征图像素在shared memory中的y轴索引base
+    const int in_start_x = blockIdx.x * blockDim.x * stride - pad;
+
+    float sum = 0.0f;
+    float* reg_kernel = d_kernel_const;
+    
+    # pragma unroll
+    for (int c = 0; c < Cin; c++) {
+        // global to shared memory 
+        # pragma unroll
+        for (int y = ty; y < SHARED_SIZE; y += blockDim.y) {
+            int in_y = in_start_y + y;
+            # pragma unroll
+            for (int x = tx; x < SHARED_SIZE; x += blockDim.x) {
+                int in_x = in_start_x + x;
+
+                s_input[y][x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
+                    input[c * H * W + in_y * W + in_x] : 0; // 边界填充0
+            }
+        }
+        __syncthreads();
+
+        // compute
+        # pragma unroll
+        for (int ky = 0; ky < KH; ++ky) {
+            int shared_y = ty * stride + ky;
+            # pragma unroll
+            for (int kx = 0; kx < KW; ++kx) {
+                // shared memory 索引
+                int shared_x = tx * stride + kx;
+                if (shared_x >= SHARED_SIZE && shared_y >= SHARED_SIZE) return;
+
+                int k_idx = out_c * Cin * KH * KW +
+                            c * KH * KW +
+                            ky * KW + kx;
+
+                sum += s_input[shared_y][shared_x] * reg_kernel[k_idx];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (out_x >= OW || out_y >= OH) return;
+    output[out_c * OH * OW + out_y * OW + out_x] = sum;
+}
+void iConv2dDirect_shared(
+    const float* __restrict__ input,   // [Cin][H][W]
+    /* kernel, */  // [Cout][Cin][KH][KW]
+    float* __restrict__ output,        // [Cout][OH][OW]
+    int Cin, int H, int W,
+    int Cout, int KH, int KW,
+    int OH, int OW,
+    int stride, int pad ) 
+{
+    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 grid(
+        CEIL(OW, block.x),
+        CEIL(OH, block.y),
+        Cout
+    );
+
+    /* const int tileSize = block.x;
+    const int TILE_SHARED = (tileSize - 1) * stride + KERNEL_SIZE ; // 共享内存的宽高: 16 + 3 - 1 =18
+    const int sharedMemBytes = INPUT_CHANNELS * TILE_SHARED * TILE_SHARED * sizeof(float); */
+
+    kConv2dDirect_shared<TILE_SHARED><<<grid, block>>>(
+        input, output,
+        Cin, H, W,
+        Cout, KH, KW,
+        OH, OW,
+        stride, pad
+    );
+} 
 
 // gpu N Tiling
 template<const int SHARED_SIZE_W,
@@ -276,8 +378,6 @@ void iConv2dDirect_N_Tiling(
     );
 
 } 
-
-
 
 // gpu N Tiling with prefetch
 template<const int SHARED_SIZE_W,
@@ -431,6 +531,115 @@ void iConv2dDirect_1x8_Tiling_prefetch(
 
 } 
 
+template<int BM, int BN, int TM, int TN, int KH, int KW, int S_H, int S_W>
+__global__ void kConv2dThread_blocked(
+    const float* __restrict__ input,   // [Cin][H][W]
+    float* __restrict__ output,        // [Cout][OH][OW]
+    int Cin, int H, int W,
+    int Cout, int OH, int OW,
+    int stride, int pad
+) 
+{
+    __shared__ float s_input[S_H][S_W];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int bx = blockIdx.x; 
+    const int by = blockIdx.y; 
+    const int out_c = blockIdx.z; 
+
+    const int out_start_y = by * BM;
+    const int out_start_x = bx * BN;
+    const int in_start_y = out_start_y * STRIDE - pad;
+    const int in_start_x = out_start_x * STRIDE - pad;
+
+    float acc[TM][TN] = {0.0f};
+
+    const int tid = ty * blockDim.x + tx;
+    const int num_threads = blockDim.x * blockDim.y;
+
+    for (int c = 0; c < Cin; c++) {
+        // global -> shared memory
+        #pragma unroll
+        for (int i = tid; i < S_H * S_W; i += num_threads) {
+            int s_y = i / S_W;
+            int s_x = i % S_W;
+            int in_y = in_start_y + s_y;
+            int in_x = in_start_x + s_x;
+            
+            s_input[s_y][s_x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
+                input[c * H * W + in_y * W + in_x] : 0; // 越界补0
+        }
+        __syncthreads();
+
+        // thread 
+        #pragma unroll
+        for (int ky = 0; ky < KH; ++ky) {
+            #pragma unroll
+            for (int kx = 0; kx < KW; ++kx) {
+                int k_idx = out_c * Cin * KH * KW + c * KH * KW + ky * KW + kx;
+    
+                #pragma unroll
+                for (int m = 0; m < TM; ++m) {
+                    #pragma unroll
+                    for (int n = 0; n < TN; ++n) {
+                        int out_y_local = ty * TM + m;
+                        int out_x_local = tx * TN + n;
+
+                        int shared_y = out_y_local * STRIDE + ky;
+                        int shared_x = out_x_local * STRIDE + kx;
+
+                        acc[m][n] += s_input[shared_y][shared_x] * d_kernel_const[k_idx];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // write back
+    #pragma unroll
+    for (int m = 0; m < TM; ++m) {
+        #pragma unroll
+        for (int n = 0; n < TN; ++n) {
+            int global_out_y = out_start_y + ty * TM + m;
+            int global_out_x = out_start_x + tx * TN + n;
+
+            if (global_out_y < OH && global_out_x < OW) {
+                output[out_c * OH * OW + global_out_y * OW + global_out_x] = acc[m][n];
+            }
+        }
+    }
+}
+void iConv2dThread_blocked(
+    const float* __restrict__ input,   
+    float* __restrict__ output,        
+    int Cin, int H, int W,
+    int Cout, int KH, int KW,
+    int OH, int OW,
+    int stride, int pad ) 
+{
+    const int TM = 4; 
+    const int TN = 4; 
+    
+    dim3 block(16, 16); 
+    
+    const int BM = block.y * TM; // 16 * 4 = 64
+    const int BN = block.x * TN; // 16 * 4 = 64
+
+    dim3 grid(CEIL(OW, BN), CEIL(OH, BM), Cout);
+
+    const int S_H = (BM - 1) * stride + KH; // 64 + 7 - 1 = 70
+    const int S_W = (BN - 1) * stride + KW; // 64 + 7 - 1 = 70
+
+    // <int BM, int BN, int TM, int TN, int KH, int KW, int S_H, int S_W>
+    kConv2dThread_blocked<64, 64, 4, 4, KERNEL_SIZE, KERNEL_SIZE, 70, 70><<<grid, block>>>(
+        input, output,
+        Cin, H, W,
+        Cout, OH, OW,
+        stride, pad
+    );
+}
 
 void init_random(std::vector<float>& input, std::vector<float>& kernel, float low = 0.f, float high = 65535.f) {
     std::mt19937 gen(123); // 固定 seed，方便复现
@@ -543,7 +752,7 @@ int main() {
 #endif
 
 #ifdef CUDA
-    // gpu naive (constant memory for kernel)
+    // gpu naive (constant -> reg)
     CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{
         iConv2dDirect_naive(
@@ -559,8 +768,26 @@ int main() {
     " [device naive]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(float));
     CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
-    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);
+    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);  
 
+    // gpu shared (global -> shared)
+    CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(float)));
+    total_time = TIME_RECORD(repeat_times, ([&]{
+        iConv2dDirect_shared(
+            d_input,
+            d_output,
+            INPUT_CHANNELS, H, W,
+            OUTPUT_CHANNELS, KH, KW,
+            OH, OW,
+            stride, pad
+        );
+    }));
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
+    " [device shared]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(float));
+    CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);  
+    
     // gpu N Tiling
     CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{
@@ -596,6 +823,24 @@ int main() {
     memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(float));
     CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);
+
+    // gpu thread (thread tile)
+    CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(float)));
+    total_time = TIME_RECORD(repeat_times, ([&]{
+        iConv2dThread_blocked(
+            d_input,
+            d_output,
+            INPUT_CHANNELS, H, W,
+            OUTPUT_CHANNELS, KH, KW,
+            OH, OW,
+            stride, pad
+        );
+    }));
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
+    " [device thread tile]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(float));
+    CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);  
 
 #endif
 
