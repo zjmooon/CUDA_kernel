@@ -10,12 +10,14 @@
 #define INPUT_CHANNELS 3
 #define OUTPUT_CHANNELS 1
 #define KERNEL_SIZE 7
-#define BLOCK_SIZE 16
+#define BLOCK_SIZE_X 32
+#define BLOCK_SIZE_Y 8
 #define STRIDE 1
 #define PADDING 0
 #define NTILING 8 // >=4, stride==1
-#define TILE_SHARED (BLOCK_SIZE - 1) * STRIDE + KERNEL_SIZE 
-#define TILE_SHARED_N (NTILING * BLOCK_SIZE - 1) * STRIDE + KERNEL_SIZE 
+#define TILE_SHARED_X (BLOCK_SIZE_X - 1) * STRIDE + KERNEL_SIZE 
+#define TILE_SHARED_Y (BLOCK_SIZE_Y - 1) * STRIDE + KERNEL_SIZE 
+#define TILE_SHARED_NX (NTILING * BLOCK_SIZE_X - 1) * STRIDE + KERNEL_SIZE 
 __constant__ float d_kernel_const[OUTPUT_CHANNELS * INPUT_CHANNELS * KERNEL_SIZE * KERNEL_SIZE];
 
 
@@ -124,7 +126,7 @@ void iConv2dDirect_naive(
     // cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, (void*)kConv2dDirect_naive, 0, 0);
     // std::cout << "minGridSize: " << minGridSize << " blockSize:" << blockSize << std::endl;
 
-    dim3 block(BLOCK_SIZE * 2, BLOCK_SIZE);
+    dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y);
     dim3 grid(
         CEIL(OW, block.x),
         CEIL(OH, block.y),
@@ -142,7 +144,9 @@ void iConv2dDirect_naive(
 
 // gpu shared memory optimized / block tile
 // https://github.com/eunomia-bpf/basic-cuda-tutorial/blob/main/06-cnn-convolution.cu
-template<const int SHARED_SIZE, const int CIN = INPUT_CHANNELS>
+template<const int SHARED_SIZE_W, 
+         const int SHARED_SIZE_H, 
+         const int CIN = INPUT_CHANNELS>
 __global__ void kConv2dDirect_shared(
     const float* __restrict__ input,   // [Cin][H][W]
     float* __restrict__ output,        // [Cout][OH][OW]
@@ -152,7 +156,7 @@ __global__ void kConv2dDirect_shared(
     int stride, int pad
 ) 
 {
-    __shared__ float s_input[SHARED_SIZE][SHARED_SIZE];
+    __shared__ float s_input[SHARED_SIZE_H][SHARED_SIZE_W];
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
@@ -173,10 +177,10 @@ __global__ void kConv2dDirect_shared(
     for (int c = 0; c < Cin; c++) {
         // global to shared memory 
         # pragma unroll
-        for (int y = ty; y < SHARED_SIZE; y += blockDim.y) {
+        for (int y = ty; y < SHARED_SIZE_H; y += blockDim.y) {
             int in_y = in_start_y + y;
             # pragma unroll
-            for (int x = tx; x < SHARED_SIZE; x += blockDim.x) {
+            for (int x = tx; x < SHARED_SIZE_W; x += blockDim.x) {
                 int in_x = in_start_x + x;
 
                 s_input[y][x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
@@ -193,7 +197,7 @@ __global__ void kConv2dDirect_shared(
             for (int kx = 0; kx < KW; ++kx) {
                 // shared memory 索引
                 int shared_x = tx * stride + kx;
-                if (shared_x >= SHARED_SIZE && shared_y >= SHARED_SIZE) return;
+                if (shared_x >= SHARED_SIZE_W && shared_y >= SHARED_SIZE_H) return;
 
                 int k_idx = out_c * Cin * KH * KW +
                             c * KH * KW +
@@ -217,7 +221,7 @@ void iConv2dDirect_shared(
     int OH, int OW,
     int stride, int pad ) 
 {
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y);
     dim3 grid(
         CEIL(OW, block.x),
         CEIL(OH, block.y),
@@ -228,7 +232,7 @@ void iConv2dDirect_shared(
     const int TILE_SHARED = (tileSize - 1) * stride + KERNEL_SIZE ; // 共享内存的宽高: 16 + 3 - 1 =18
     const int sharedMemBytes = INPUT_CHANNELS * TILE_SHARED * TILE_SHARED * sizeof(float); */
 
-    kConv2dDirect_shared<TILE_SHARED><<<grid, block>>>(
+    kConv2dDirect_shared<TILE_SHARED_X, TILE_SHARED_Y><<<grid, block>>>(
         input, output,
         Cin, H, W,
         Cout, KH, KW,
@@ -362,21 +366,20 @@ void iConv2dDirect_N_Tiling(
     int OH, int OW,
     int stride, int pad) 
 {
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y);
     dim3 grid(
         CEIL(OW, block.x * NTILING),
         CEIL(OH, block.y),
         Cout
     );
 
-    kConv2dDirect_1x8_Tiling<TILE_SHARED_N, TILE_SHARED, NTILING, INPUT_CHANNELS><<<grid, block>>>(
+    kConv2dDirect_1x8_Tiling<TILE_SHARED_NX, TILE_SHARED_Y, NTILING, INPUT_CHANNELS><<<grid, block>>>(
         input, output,
         Cin, H, W,
         Cout, KH, KW,
         OH, OW,
         1, pad 
     );
-
 } 
 
 // gpu N Tiling with prefetch
@@ -514,14 +517,14 @@ void iConv2dDirect_1x8_Tiling_prefetch(
     int OH, int OW,
     int stride, int pad) 
 {
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y);
     dim3 grid(
         CEIL(OW, block.x * NTILING),
         CEIL(OH, block.y),
         Cout
     );
 
-    kConv2dDirect_1x8_Tiling_prefetch<TILE_SHARED_N, TILE_SHARED, NTILING, INPUT_CHANNELS><<<grid, block>>>(
+    kConv2dDirect_1x8_Tiling_prefetch<TILE_SHARED_NX, TILE_SHARED_Y, NTILING, INPUT_CHANNELS><<<grid, block>>>(
         input, output,
         Cin, H, W,
         Cout, KH, KW,
@@ -622,18 +625,18 @@ void iConv2dThread_blocked(
     const int TM = 4; 
     const int TN = 4; 
     
-    dim3 block(16, 16); 
+    dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y); 
     
-    const int BM = block.y * TM; // 16 * 4 = 64
-    const int BN = block.x * TN; // 16 * 4 = 64
+    const int BM = block.y * TM; // 8 * 4 = 32
+    const int BN = block.x * TN; // 32 * 4 = 128
 
     dim3 grid(CEIL(OW, BN), CEIL(OH, BM), Cout);
 
-    const int S_H = (BM - 1) * stride + KH; // 64 + 7 - 1 = 70
-    const int S_W = (BN - 1) * stride + KW; // 64 + 7 - 1 = 70
+    const int S_H = (BM - 1) * stride + KH; // 32 + 7 - 1 = 38
+    const int S_W = (BN - 1) * stride + KW; // 128 + 7 - 1 = 134
 
     // <int BM, int BN, int TM, int TN, int KH, int KW, int S_H, int S_W>
-    kConv2dThread_blocked<64, 64, 4, 4, KERNEL_SIZE, KERNEL_SIZE, 70, 70><<<grid, block>>>(
+    kConv2dThread_blocked<32, 128, 4, 4, KERNEL_SIZE, KERNEL_SIZE, 38, 134><<<grid, block>>>(
         input, output,
         Cin, H, W,
         Cout, OH, OW,
@@ -711,8 +714,8 @@ int main() {
     int stride = STRIDE, pad = PADDING;
 
     // 计算卷积后输出尺寸
-    int OH = (H + 2 * pad - KH) / stride + 1;
-    int OW = (W + 2 * pad - KW) / stride + 1;
+    int OH = (H + 2 * pad - KH) / stride + 1; // 2160 + 2 - 7 / 1 + 1 = 2154
+    int OW = (W + 2 * pad - KW) / stride + 1; // 3840 + 2 - 7 / 1 + 1 = 3834
 
     std::vector<float> h_input(INPUT_CHANNELS * H * W);
     std::vector<float> h_kernel(OUTPUT_CHANNELS * INPUT_CHANNELS * KH * KW);

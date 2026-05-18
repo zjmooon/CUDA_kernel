@@ -1,0 +1,92 @@
+CUDA实现直接卷积direct-convolution，采用了一些必要的优化方式
+本文主要描述怎么从直接卷积的naive实现到搬运全局内存到共享内存避免重复访问全局内存引起的低内存访问效率
+
+一些分析核函数性能的术语：
+计算访存比：单位线程内 计算指令数/访存指令数
+运算强度(Arithmetic Intensity[FLOP/byte]):单位内存交换量(byte)下所完成的浮点运算次数(FLOPs) operations(FLOPs)/memory traffic(byte) 
+Roofline：判断程序性能瓶颈的模型 
+    竖轴Performance[FLOPS]：计算机硬件可达到的性能（FLOPS(FLOP/s)每秒可处理的浮点运算的次数 如GFLOPS,TFLOPS...）
+        与FLOPs不是一个概念，FLOPs是衡量模型，kernel大小的指标
+    横轴运算强度Arithmetic Intensity[FLOP/byte]
+
+memory bound：在roofline拐点左边，GPU算力未达到极限，但显存带宽已到极限
+    场景 简单的向量加法，数据搬运
+    优化 减少访存次数，使用共享内存，合并访存
+compute bound：在roofline拐点右边，显存搬运速度足够快，但CUDA core计算已到极限
+    场景 高阶矩阵乘，复杂的数学运算(exp)，大卷积
+    优化 优化算法逻辑，Tensor core
+lantency bound：距离roofline线远，内存访问延迟和指令执行延迟太高，导致硬件等待
+    访存延迟
+        全局内存访问延迟(400~800 clock cycle)
+        共享内存访问延迟(20~30 clock cycle)
+        
+        优化
+            对齐访存，合并访存
+            避免bank conflict导致串行访问
+            提高warp占用率以覆盖访存延迟
+
+    指令执行延迟：
+        相邻指令间存在数据依赖，导致流水线阻塞
+
+        优化
+            数据预取
+
+时延 (Lantency): Warp 准备好执行下一条指令所需的时钟周期数，
+    并且，如果所有 Warp 调度器在时延期间的每个时钟周期上都有一些可以发射的指令，那么 GPU 就可以实现完全利用，换句话说，时延隐藏 (hidden) 时系统利用率达到最大。
+    对具有 L 个时钟周期的时延进行隐藏所需的指令数量取决于指令自身的吞吐量。
+    对于计算能力8.x 的设备来说，该值为 4L。因为对于这些设备，SM 在一个时钟周期内为每个 Warp 发出一条指令，一次四个 warp。
+
+占用率： SM中活跃的warp数/最大warp数
+    更高的占用率一般性能更好，隐藏内存延迟
+    SM最多可处理1536/32=48warp 
+    限制占用率的一般有
+        每个块中共享内存过多，每个线程的寄存器过多（可使用 nvcc 编译标志 --maxregcount控制reg数量，-Xptxas=-v获取核函数的寄存器和共享内存使用情况）
+        每个块中线程数量过低，至少128
+    API 
+        cudaOccupancyMaxPotentialBlockSize 在不运行核函数的情况下，自动找出一个最佳的blockSize，使得GPU的占有率达到理论最大化。
+
+
+基本的性能术语已经解释完了，接下来进入核函数的分析和优化
+
+kConv2dDirect_naive：
+    高性能
+        将可以预计算的滤波值先存储在const中，在进入kernel后将其搬运到reg中，加快访问速度
+    瓶颈
+        roofline： 在拐点左侧，但是距离roofline比较远，结合后续ncu分析，优化优先级应该以lantency bound为主
+        全局内存的访问延迟大，从ncu中的 Long Scoreboard (58.74%)， 等待“长延迟操作”的stall warp (运算强度几乎为1)
+        存在未对齐访存或者非合并访存的情况
+            查看"Memory Workload Analysis"->"L1/TEX Cache"->"Global Load"/"Global Store"->"Sectors/Req"
+            发生合并访存时，最小访存单位[byte]等于Sectors/Req；如果最小访存单位小于Sectors/Req，说明实际访存数据超过了需要的数据；
+            如ncu所示:Sectors/Req 5.71，5.79均大于与本kernel的最小访存单位4byte(float)。 (OW%32!=0,访存未对齐)
+            另一证明是ncu source栏目中访存代码中也有警告"global accesses are excessive"
+    可能的优化方向
+        向量化  减少指令数，提高计算访存比
+        double buffer   提前加载全局内存，减少stall warp长延迟操作的时间
+        shared memory   因为naive对全局内存有重复load，搬运到shared中可以减少不必要的访存延迟
+            卷积:OH*OW*Cout*Cin*KH*KW -> grid.x*grid.x*grid.z(Cout)*Cin*SHARED_SIZE*SHARED_SIZE (3840*2160下，GB和MB数量级的差距)
+            如sgemm，从mn(k+k)->MN(k*bm+k*bn)==m/bm*n/bn(k*bm+k*bn)
+            (为便于对比，均排除L1,L2缓存的情况。实际情况下：当发出global load req时，会先后访问L1，L2，判断tag是否miss/hit，
+            均miss后才会load device memory. 而且load时会额外load 局部device mem)
+
+kConv2dDirect_shared：
+    对比naive版本，并没有预想中的性能大提升，不到5%。
+    shared memory的加入
+        DRAM Throughtput变大了， 这个指标变大有点反直觉，因为shared mem的加入应该会减少dram读取的字节数。但如果细看这个指标点的定义的话就会发现
+            DRAM Throughput [%] (This throughput metric represents the percent of the peak sustained rate achieved during elapsed cycles across all sub-unit instances)
+            虽然总数据量变小了，但因为运行时间（Time）缩短得更厉害，导致整个 Kernel 生命周期的平均物理带宽利用率反而被拉高了。
+        Device Memory的Load反而变大了，按理说这个应该是会大幅减少的，猜测还是因为缓存的一些机制，可以进一步看下Memory Chart
+            可以看到kernel发出的loadInst，Req确实减少了符合预期，出现问题的是L2 Cache Load Device Mem这个步骤。
+    运算强度也有所增加，因为分子（FLOPs）不变，分母（DRAM Bytes）变小了，Kernel 会从 Roofline 的左侧斜坡（访存受限区）向右边的平顶区域（计算受限区）移动
+    Memory WorkLoad Analysis的L1/TEX Hit Rate大幅降低，因为数据搬到 Shared Memory 后，绕过了 L1/TEX 缓存，shared memory有单独的通道MIO Pipe(硬件上实现global和shared memory两条并行的指令执行电路)
+    stall long scoreboard的明显减少，说明全局内存的访问延迟大的情况得到减轻
+    使用shared Mem但性能没有明显提高，很自然的会想到bank conflict. ncu也证实确实存在: shared load 有两路冲突而 shared store 有1点多conflict
+        load，线程块是 block(16, 16)。一个 Warp 有 32 个线程：前 16 个线程（Thread 0~15）的 ty = 0，tx = 0..15（处理共享内存第 0 行）。后 16 个线程（Thread 16~31）的 ty = 1，tx = 0..15（处理共享内存第 1 行）。
+            也就是说，一个 Warp 跨越了共享内存的两行。而二维数组声明：__shared__ float s_input[22][22];（SHARED_SIZE = 22）。它是行优先连续排布的。
+            让 Warp 里的线程同时执行计算代码：s_input[shared_y][shared_x]。假设此时 ky=0, kx=0：Thread 0 (ty=0, tx=0) 
+            thread0(ty=0, tx=0)  访问：22 + 0 = 0 -> Bank0
+            thread26(ty=1, tx=10) 访问：1*22 + 10 = 32 -> Bank0
+            同一warp的不同线程thread0 和 thread26 会在同一时刻向 Bank0。同理，thread1 和 thread27 撞在 Bank1...
+        怎么解决：修改block的布局 由block(16, 16)->block(32, 8)，TILE_SHARED对应修改。
+        block数： grid.x*grid.x*grid.z=ceil(3834/16)*ceil(2154/16)*1=32400，warp/block：block.x*block.y/32=8,warp数：32400*8=259200，
+            每个warp中shared load的次数为Cin*KERNEL_SIZE*KERNEL_SIZE=3*7*7=147,则总的shared load instructions, reqs:259200*147=38102400,
+            而每warp又是有2路conflicts 所以 38102400*1
