@@ -184,7 +184,7 @@ __global__ void kConv2dDirect_shared(
                 int in_x = in_start_x + x;
 
                 s_input[y][x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
-                    input[c * H * W + in_y * W + in_x] : 0; // 边界填充0
+                    input[c * H * W + in_y * W + in_x] : 0.0f; // 边界填充0
             }
         }
         __syncthreads();
@@ -268,7 +268,6 @@ __global__ void kConv2dDirect_1x8_Tiling(
     const int out_x_5 = out_x_4 + blockDim.x;
     const int out_x_6 = out_x_5 + blockDim.x;
     const int out_x_7 = out_x_6 + blockDim.x;
-
     const int out_y = blockIdx.y * blockDim.y + ty;
     const int out_c = blockIdx.z;
 
@@ -276,15 +275,10 @@ __global__ void kConv2dDirect_1x8_Tiling(
 
     const int in_start_y = blockIdx.y * blockDim.y - pad;
     const int in_start_x = blockIdx.x * blockDim.x * N_TILE - pad;
+    float* reg_kernel = d_kernel_const;
 
-    float sum0 = 0.0f;
-    float sum1 = 0.0f;
-    float sum2 = 0.0f;
-    float sum3 = 0.0f;
-    float sum4 = 0.0f;
-    float sum5 = 0.0f;
-    float sum6 = 0.0f;
-    float sum7 = 0.0f;
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    float sum4 = 0.0f, sum5 = 0.0f, sum6 = 0.0f, sum7 = 0.0f;
     
     for (int c = 0; c < Cin; c++) {
         // global to shared memory 
@@ -308,7 +302,7 @@ __global__ void kConv2dDirect_1x8_Tiling(
             int shared_idx_y = ty + ky;
             # pragma unroll
             for (int kx = 0; kx < KW; ++kx) {
-                int f = d_kernel_const[out_c * Cin * KH * KW +
+                float f = reg_kernel[out_c * Cin * KH * KW +
                             c * KH * KW +
                             ky * KW + kx];
                 
@@ -346,15 +340,17 @@ __global__ void kConv2dDirect_1x8_Tiling(
         __syncthreads();
     }
 
-    int base = out_c * OH * OW + out_y * OW;
-    if (out_x_0 < OW) output[base + out_x_0] = sum0;
-    if (out_x_1 < OW) output[base + out_x_1] = sum1;
-    if (out_x_2 < OW) output[base + out_x_2] = sum2;
-    if (out_x_3 < OW) output[base + out_x_3] = sum3;
-    if (out_x_4 < OW) output[base + out_x_4] = sum4;
-    if (out_x_5 < OW) output[base + out_x_5] = sum5;
-    if (out_x_6 < OW) output[base + out_x_6] = sum6;
-    if (out_x_7 < OW) output[base + out_x_7] = sum7;
+    if (out_y < OH && out_c < Cout) {
+        int base = out_c * OH * OW + out_y * OW;
+        if (out_x_0 < OW) output[base + out_x_0] = sum0;
+        if (out_x_1 < OW) output[base + out_x_1] = sum1;
+        if (out_x_2 < OW) output[base + out_x_2] = sum2;
+        if (out_x_3 < OW) output[base + out_x_3] = sum3;
+        if (out_x_4 < OW) output[base + out_x_4] = sum4;
+        if (out_x_5 < OW) output[base + out_x_5] = sum5;
+        if (out_x_6 < OW) output[base + out_x_6] = sum6;
+        if (out_x_7 < OW) output[base + out_x_7] = sum7;
+    }
     
 }
 void iConv2dDirect_N_Tiling(
@@ -417,15 +413,10 @@ __global__ void kConv2dDirect_1x8_Tiling_prefetch(
 
     const int in_start_y = blockIdx.y * blockDim.y - pad;
     const int in_start_x = blockIdx.x * blockDim.x * N_TILE - pad;
+    float* reg_kernel = d_kernel_const;
 
-    float sum0 = 0.0f;
-    float sum1 = 0.0f;
-    float sum2 = 0.0f;
-    float sum3 = 0.0f;
-    float sum4 = 0.0f;
-    float sum5 = 0.0f;
-    float sum6 = 0.0f;
-    float sum7 = 0.0f;
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    float sum4 = 0.0f, sum5 = 0.0f, sum6 = 0.0f, sum7 = 0.0f;
 
     int cur = 0;
     int next = 1;
@@ -461,7 +452,7 @@ __global__ void kConv2dDirect_1x8_Tiling_prefetch(
             int shared_idx_y = ty + ky;
             #pragma unroll
             for (int kx = 0; kx < KW; ++kx) {
-                float f = d_kernel_const[
+                float f = reg_kernel[
                     out_c * Cin * KH * KW +
                     c * KH * KW +
                     ky * KW + kx
@@ -497,16 +488,17 @@ __global__ void kConv2dDirect_1x8_Tiling_prefetch(
         next = tmp;
     }
 
-    int base = out_c * OH * OW + out_y * OW;
-    if (out_x_0 < OW) output[base + out_x_0] = sum0;
-    if (out_x_1 < OW) output[base + out_x_1] = sum1;
-    if (out_x_2 < OW) output[base + out_x_2] = sum2;
-    if (out_x_3 < OW) output[base + out_x_3] = sum3;
-    if (out_x_4 < OW) output[base + out_x_4] = sum4;
-    if (out_x_5 < OW) output[base + out_x_5] = sum5;
-    if (out_x_6 < OW) output[base + out_x_6] = sum6;
-    if (out_x_7 < OW) output[base + out_x_7] = sum7;
-
+    if (out_y < OH && out_c < Cout) {
+        int base = out_c * OH * OW + out_y * OW;
+        if (out_x_0 < OW) output[base + out_x_0] = sum0;
+        if (out_x_1 < OW) output[base + out_x_1] = sum1;
+        if (out_x_2 < OW) output[base + out_x_2] = sum2;
+        if (out_x_3 < OW) output[base + out_x_3] = sum3;
+        if (out_x_4 < OW) output[base + out_x_4] = sum4;
+        if (out_x_5 < OW) output[base + out_x_5] = sum5;
+        if (out_x_6 < OW) output[base + out_x_6] = sum6;
+        if (out_x_7 < OW) output[base + out_x_7] = sum7;        
+    }
 }
 void iConv2dDirect_1x8_Tiling_prefetch(
     const float* __restrict__ input,   // [Cin][H][W]
@@ -531,8 +523,284 @@ void iConv2dDirect_1x8_Tiling_prefetch(
         OH, OW,
         1, pad 
     );
-
 } 
+
+/* 
+* 使用float4向量化优化。
+* Using vectorized loads reduces the total number of instructions, reduces latency, and improves bandwidth utilization.
+* 线程布局在grid维度最内层除以4。
+* https://developer.nvidia.com/blog/cuda-pro-tip-increase-performance-with-vectorized-memory-access/
+*/
+template<const int SHARED_SIZE_W,
+         const int SHARED_SIZE_H, 
+         const int N_TILE,
+         const int CIN>
+__global__ void kConv2dDirect_8_Tiling_float4_load(
+    const float* __restrict__ input,   // [Cin][H][W]
+    float* __restrict__ output,        // [Cout][OH][OW]
+    int Cin, int H, int W,
+    int Cout, int KH, int KW,
+    int OH, int OW,
+    int stride, int pad  // stride == 1
+) 
+{
+    __shared__ float s_input[SHARED_SIZE_H][SHARED_SIZE_W];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int out_x_0 = blockIdx.x * blockDim.x * N_TILE + tx;
+    const int out_x_1 = out_x_0 + blockDim.x;
+    const int out_x_2 = out_x_1 + blockDim.x;
+    const int out_x_3 = out_x_2 + blockDim.x;
+    const int out_x_4 = out_x_3 + blockDim.x;
+    const int out_x_5 = out_x_4 + blockDim.x;
+    const int out_x_6 = out_x_5 + blockDim.x;
+    const int out_x_7 = out_x_6 + blockDim.x;
+    const int out_y = blockIdx.y * blockDim.y + ty;
+    const int out_c = blockIdx.z;
+
+    // if (out_y >= OH || out_c >= Cout) return;  // 会与后续的__syncthreads() 构成死锁
+
+    const int in_start_y = blockIdx.y * blockDim.y - pad;
+    const int in_start_x = blockIdx.x * blockDim.x * N_TILE - pad;
+    float* reg_kernel = d_kernel_const;
+
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    float sum4 = 0.0f, sum5 = 0.0f, sum6 = 0.0f, sum7 = 0.0f;
+
+    for (int c = 0; c < Cin; c++) {
+        // global to shared memory 
+        // 合并访存以及避免Bank Conflict
+        # pragma unroll
+        for (int y = ty; y < SHARED_SIZE_H; y += blockDim.y) {
+            int in_y = in_start_y + y;
+            bool y_valid = (in_y >= 0 && in_y < H); // 增加 y 有效性检查
+
+            # pragma unroll
+            for (int x = tx * 4; x < SHARED_SIZE_W; x += blockDim.x * 4) {
+                int in_x = in_start_x + x;
+                float4 v = {0, 0, 0, 0};
+
+                // 只有当起始地址对齐且不越界时才使用 float4
+                if (y_valid && in_x >= 0 && in_x + 3 < W) {
+                    v = reinterpret_cast<const float4*>(&input[c * H * W + in_y * W + in_x])[0];
+                } 
+                else {
+                    // 逐个元素读取，同时检查 y_valid 和 x 范围
+                    if (y_valid) {
+                        if (in_x + 0 >= 0 && in_x + 0 < W) v.x = input[c * H * W + in_y * W + in_x + 0];
+                        if (in_x + 1 >= 0 && in_x + 1 < W) v.y = input[c * H * W + in_y * W + in_x + 1];
+                        if (in_x + 2 >= 0 && in_x + 2 < W) v.z = input[c * H * W + in_y * W + in_x + 2];
+                        if (in_x + 3 >= 0 && in_x + 3 < W) v.w = input[c * H * W + in_y * W + in_x + 3];
+                    }
+                }
+
+                // 边界，避免写入s_input[y][131]的情况
+                if (x + 0 < SHARED_SIZE_W) s_input[y][x + 0] = v.x;
+                if (x + 1 < SHARED_SIZE_W) s_input[y][x + 1] = v.y;
+                if (x + 2 < SHARED_SIZE_W) s_input[y][x + 2] = v.z;
+                if (x + 3 < SHARED_SIZE_W) s_input[y][x + 3] = v.w;
+            }
+        }
+        __syncthreads();
+        
+        // convolution compute
+        # pragma unroll
+        for (int ky = 0; ky < KH; ++ky) {
+            int shared_idx_y = ty + ky;
+            # pragma unroll
+            for (int kx = 0; kx < KW; ++kx) {
+                float f = reg_kernel[out_c * Cin * KH * KW +
+                            c * KH * KW +
+                            ky * KW + kx];
+                
+                // shared memory 索引映射
+                int shared_x0 = tx + kx;
+
+                float s0 = s_input[shared_idx_y][shared_x0];
+                float s1 = s_input[shared_idx_y][shared_x0 + blockDim.x];
+                float s2 = s_input[shared_idx_y][shared_x0 + blockDim.x * 2];
+                float s3 = s_input[shared_idx_y][shared_x0 + blockDim.x * 3];
+                float s4 = s_input[shared_idx_y][shared_x0 + blockDim.x * 4];
+                float s5 = s_input[shared_idx_y][shared_x0 + blockDim.x * 5];
+                float s6 = s_input[shared_idx_y][shared_x0 + blockDim.x * 6];
+                float s7 = s_input[shared_idx_y][shared_x0 + blockDim.x * 7];
+
+                sum0 += s0 * f;
+                sum1 += s1 * f;
+                sum2 += s2 * f;
+                sum3 += s3 * f;
+                sum4 += s4 * f;
+                sum5 += s5 * f;
+                sum6 += s6 * f;
+                sum7 += s7 * f;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (out_y < OH && out_c < Cout) {
+        int base = out_c * OH * OW + out_y * OW;
+        if (out_x_0 < OW) output[base + out_x_0] = sum0;
+        if (out_x_1 < OW) output[base + out_x_1] = sum1;
+        if (out_x_2 < OW) output[base + out_x_2] = sum2;
+        if (out_x_3 < OW) output[base + out_x_3] = sum3;
+        if (out_x_4 < OW) output[base + out_x_4] = sum4;
+        if (out_x_5 < OW) output[base + out_x_5] = sum5;
+        if (out_x_6 < OW) output[base + out_x_6] = sum6;
+        if (out_x_7 < OW) output[base + out_x_7] = sum7;        
+    }
+}
+void iConv2dDirect_8_Tiling_float4_load(
+    const float* __restrict__ input,   // [Cin][H][W]
+    /* kernel, */  // [Cout][Cin][KH][KW]
+    float* __restrict__ output,        // [Cout][OH][OW]
+    int Cin, int H, int W,
+    int Cout, int KH, int KW,
+    int OH, int OW,
+    int stride, int pad) 
+{
+    dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y);
+    dim3 grid(
+        CEIL(OW, block.x * NTILING),
+        CEIL(OH, block.y),
+        Cout
+    );
+
+    kConv2dDirect_8_Tiling_float4_load<TILE_SHARED_NX, TILE_SHARED_Y, NTILING, INPUT_CHANNELS><<<grid, block>>>(
+        input, output,
+        Cin, H, W,
+        Cout, KH, KW,
+        OH, OW,
+        1, pad 
+    );
+} 
+
+template<const int SHARED_SIZE_W,
+         const int SHARED_SIZE_H, 
+         const int N_TILE,
+         const int CIN>
+__global__ void kConv2dDirect_8_Tiling_float4_store(
+    const float* __restrict__ input,   // [Cin][H][W]
+    float* __restrict__ output,        // [Cout][OH][OW]
+    int Cin, int H, int W,
+    int Cout, int KH, int KW,
+    int OH, int OW,
+    int stride, int pad  // stride == 1
+) 
+{
+    __shared__ float s_input[SHARED_SIZE_H][SHARED_SIZE_W];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    // 为了能在global store时 float4，现在，线程tx将负责输出特征图上水平连续的8个像素
+    const int out_x_base = blockIdx.x * blockDim.x * N_TILE + tx * N_TILE;
+    const int out_y = blockIdx.y * blockDim.y + ty;
+    const int out_c = blockIdx.z;
+
+    const int in_start_y = blockIdx.y * blockDim.y - pad;
+    const int in_start_x = blockIdx.x * blockDim.x * N_TILE - pad;
+    float* reg_kernel = d_kernel_const;
+
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    float sum4 = 0.0f, sum5 = 0.0f, sum6 = 0.0f, sum7 = 0.0f;
+    
+    for (int c = 0; c < Cin; c++) {
+        // global to shared memory
+        # pragma unroll
+        for (int y = ty; y < SHARED_SIZE_H; y += blockDim.y) {
+            int in_y = in_start_y + y;
+            # pragma unroll
+            for (int x = tx; x < SHARED_SIZE_W; x += blockDim.x) {
+                int in_x = in_start_x + x;
+                s_input[y][x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
+                    input[c * H * W + in_y * W + in_x] : 0.0f; 
+            }
+        }
+        __syncthreads();
+        
+        // Convolution Compute
+        # pragma unroll
+        for (int ky = 0; ky < KH; ++ky) {
+            int shared_idx_y = ty + ky;
+            # pragma unroll
+            for (int kx = 0; kx < KW; ++kx) {
+                float f = reg_kernel[out_c * Cin * KH * KW + c * KH * KW + ky * KW + kx];
+                
+                // 因为线程负责连续像素，这里的读取索引也变成连续的
+                int shared_x0 = tx * N_TILE + kx;
+
+                float s0 = s_input[shared_idx_y][shared_x0 + 0];
+                float s1 = s_input[shared_idx_y][shared_x0 + 1];
+                float s2 = s_input[shared_idx_y][shared_x0 + 2];
+                float s3 = s_input[shared_idx_y][shared_x0 + 3];
+                float s4 = s_input[shared_idx_y][shared_x0 + 4];
+                float s5 = s_input[shared_idx_y][shared_x0 + 5];
+                float s6 = s_input[shared_idx_y][shared_x0 + 6];
+                float s7 = s_input[shared_idx_y][shared_x0 + 7];
+
+                sum0 += s0 * f;
+                sum1 += s1 * f;
+                sum2 += s2 * f;
+                sum3 += s3 * f;
+                sum4 += s4 * f;
+                sum5 += s5 * f;
+                sum6 += s6 * f;
+                sum7 += s7 * f;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (out_y < OH && out_c < Cout) {
+        int base = out_c * OH * OW + out_y * OW + out_x_base;
+        
+        // float4 指针强转要求物理内存地址必须严格按照 16 字节对齐
+        bool is_aligned = (((size_t)&output[base]) % 16 == 0);
+        
+        // 只有在地址对齐，且没有越出图像边界时，才启用 float4
+        if (is_aligned && (out_x_base + 7 < OW)) {
+            float4* out_ptr = reinterpret_cast<float4*>(&output[base]);
+            out_ptr[0] = make_float4(sum0, sum1, sum2, sum3);
+            out_ptr[1] = make_float4(sum4, sum5, sum6, sum7);
+        }
+        else {
+            if (out_x_base + 0 < OW) output[base + 0] = sum0;
+            if (out_x_base + 1 < OW) output[base + 1] = sum1;
+            if (out_x_base + 2 < OW) output[base + 2] = sum2;
+            if (out_x_base + 3 < OW) output[base + 3] = sum3;
+            if (out_x_base + 4 < OW) output[base + 4] = sum4;
+            if (out_x_base + 5 < OW) output[base + 5] = sum5;
+            if (out_x_base + 6 < OW) output[base + 6] = sum6;
+            if (out_x_base + 7 < OW) output[base + 7] = sum7;
+        }
+    }
+}
+void iConv2dDirect_8_Tiling_float4_store(
+    const float* __restrict__ input,   
+    float* __restrict__ output,        
+    int Cin, int H, int W,
+    int Cout, int KH, int KW,
+    int OH, int OW,
+    int stride, int pad) 
+{
+    dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y);
+    dim3 grid(
+        CEIL(OW, block.x * NTILING),
+        CEIL(OH, block.y),
+        Cout
+    );
+
+    kConv2dDirect_8_Tiling_float4_store<TILE_SHARED_NX, TILE_SHARED_Y, NTILING, INPUT_CHANNELS><<<grid, block>>>(
+        input, output,
+        Cin, H, W,
+        Cout, KH, KW,
+        OH, OW,
+        1, pad 
+    );
+}
 
 template<int BM, int BN, int TM, int TN, int KH, int KW, int S_H, int S_W>
 __global__ void kConv2dThread_blocked(
@@ -560,6 +828,8 @@ __global__ void kConv2dThread_blocked(
 
     const int tid = ty * blockDim.x + tx;
     const int num_threads = blockDim.x * blockDim.y;
+    
+    float* reg_kernel = d_kernel_const;
 
     for (int c = 0; c < Cin; c++) {
         // global -> shared memory
@@ -571,7 +841,7 @@ __global__ void kConv2dThread_blocked(
             int in_x = in_start_x + s_x;
             
             s_input[s_y][s_x] = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
-                input[c * H * W + in_y * W + in_x] : 0; // 越界补0
+                input[c * H * W + in_y * W + in_x] : 0.0f; // 越界补0
         }
         __syncthreads();
 
@@ -592,7 +862,7 @@ __global__ void kConv2dThread_blocked(
                         int shared_y = out_y_local * STRIDE + ky;
                         int shared_x = out_x_local * STRIDE + kx;
 
-                        acc[m][n] += s_input[shared_y][shared_x] * d_kernel_const[k_idx];
+                        acc[m][n] += s_input[shared_y][shared_x] * reg_kernel[k_idx];
                     }
                 }
             }
@@ -690,19 +960,23 @@ void verifyResult(const float* host, const float* kernel, size_t size, double ep
 
 
 /*
-* 在 GPU 上做卷积最常见的三类方法：
+* 在 GPU 上做卷积常见的四类方法：
 * 1. GEMM-based 卷积（im2col + GEMM）
 * 把卷积变成矩阵乘法，再用 cuBLAS/优化矩阵乘法库加速。（内存占用高）
 * 
-* 2. FFT/Winograd 卷积
+* 2. Implicit GEMM 卷积（基于GEMM的优化版本）
+* 避免显式的 im2col 变换，直接在计算过程中重复利用输入数据，减少内存占用和数据移动。
+* 主要是需要熟悉维度转换 输入特征图NCHW，卷积核KCRS和输出特征图NKH(out)W(out)
+* 
+* 3. FFT/Winograd 卷积
 * 面向较大卷积核或特定尺寸优化（频域卷积/优化算法）。
 * 
-* 3. 直接卷积（Direct Convolution）
+* 4. 直接卷积（Direct Convolution）
 * 直接按照卷积定义逐元素计算，不作 im2col 变换。性能受益于合理的内存访问与优化策略。
 *
 * Input  : N x Cin x H x W (batch N默认为1)
-* Kernel : Cout x Cin x KH x KW
-* Output : N x Cout x OH x OW
+* Kernel : Cout(K) x Cin x KH(R) x KW(S)
+* Output : N x Cout(K) x OH x OW
 */
 int main() {
     int repeat_times = 10;
@@ -825,8 +1099,44 @@ int main() {
     " [device 1x" << NTILING << " Tiling with prefetch]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(float));
     CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
-    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);
-
+    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW); 
+    
+    // gpu N Tiling with float4 laod
+    CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(float)));
+    total_time = TIME_RECORD(repeat_times, ([&]{
+        iConv2dDirect_8_Tiling_float4_load(
+            d_input,
+            d_output,
+            INPUT_CHANNELS, H, W,
+            OUTPUT_CHANNELS, KH, KW,
+            OH, OW,
+            stride, pad
+        );
+    }));
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
+    " [device 1x" << NTILING << " Tiling with float4 load]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(float));
+    CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW); 
+    
+    // gpu N Tiling with float4 store
+    CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(float)));
+    total_time = TIME_RECORD(repeat_times, ([&]{
+        iConv2dDirect_8_Tiling_float4_store(
+            d_input,
+            d_output,
+            INPUT_CHANNELS, H, W,
+            OUTPUT_CHANNELS, KH, KW,
+            OH, OW,
+            stride, pad
+        );
+    }));
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
+    " [device 1x" << NTILING << " Tiling with float4 store]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(float));
+    CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW); 
+    
     // gpu thread (thread tile)
     CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(float)));
     total_time = TIME_RECORD(repeat_times, ([&]{
@@ -843,7 +1153,7 @@ int main() {
     " [device thread tile]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(float));
     CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
-    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);  
+    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);   
 
 #endif
 
