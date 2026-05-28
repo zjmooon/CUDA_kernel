@@ -1,10 +1,10 @@
 # CUDA 2D 直接卷积的性能演进：从 Naive 到 Thread Blocked 优化实践
 
-在算子开发中，卷积无论是在使用频率还是在使用耗时上都占有巨大角色，常见的img2col, implicite sgemm当然极具挑战性。直接卷积（Direct Convolution）可以作为CUDA学习的一个很好的实践，当然自己实现的核函数总是会有很多问题，更多的还是一次勇于尝试。
+在算子开发中，卷积无论是在使用频率还是在使用耗时上都占有巨大角色，常见的img2col, implicite sgemm当然极具挑战性。直接卷积（Direct Convolution）可以作为CUDA学习的一个很好的实践，当然自己实现的核函数总是会有很多问题，更多的还是一次尝试。
 
 本文主要记录并分析 CUDA 2D 直接卷积（Direct Convolution）从最原始的 Naive 实现，到逐步引入共享内存（Shared Memory）、线程粗化、向量化访存以及线程块阻塞（Thread Blocked）等加速技术，避免重复访问全局内存（Global Memory）以提升内存访问效率的完整演进过程。
 
-以4K图像作为输入，3840 * 2160，输入通道1或3，输出通道1，卷积核尺寸为7 * 7，stride，padding默认为1和0.
+以4K图像作为输入，3840 * 2160，输入通道1或3，输出通道1，卷积核尺寸为7 * 7，stride，padding默认为1和0.(GTX4080S)
 ![alt text](convolution2d_elapse_c1.png) 
 ![alt text](convolution2d_elapse_c3.png)
 ---
@@ -69,10 +69,11 @@ $$\text{占用率} = \frac{\text{SM 中活跃的 Warp 数}}{\text{理论最大 W
     *   双缓冲（Double Buffering）：提前加载全局内存，缩短 Long Scoreboard 导致的 Stall 时间。
     *   共享内存（Shared Memory）：Naive 版本对全局内存有严重的重复加载。搬运到 Shared Memory 中可大幅减少无效的延迟。
     *   *数据空间缩减理论*：
-        $$\text{Naive 访存量} = OH \times OW \times C_{\text{out}} \times C_{\text{in}} \times KH \times KW$$
-        $$\text{Shared 理论访存量} = \text{grid.x} \times \text{grid.y} \times \text{grid.z}(C_{\text{out}}) \times C_{\text{in}} \times \text{SHARED\_SIZE} \times \text{SHARED\_SIZE}$$
-        在 $3840 \times 2160$ 分辨率下，两者存在 **GB 与 MB** 数量级的巨大差距（类似于 SGEMM 将访存从 $mn(k+k)$ 优化至 $MN(k \cdot b_m + k \cdot b_n) = \frac{m}{b_m} \frac{n}{b_n}(k \cdot b_m + k \cdot b_n)$）。
+
+         $$\text{Naive 访存量} = OH \times OW \times C_{\text{out}} \times C_{\text{in}} \times KH \times KW$$
         
+         $$\text{Shared 理论访存量} = \text{grid.x} \times \text{grid.y} \times \text{grid.z}(C_{\text{out}}) \times C_{\text{in}} \times \text{SHAREDSIZE} \times \text{SHAREDSIZE}$$
+        在 $3840 \times 2160$ 分辨率下，两者存在 **GB 与 MB** 数量级的巨大差距（类似于 SGEMM 将访存从 $mn(k+k)$ 优化至 $MN(k \cdot b_m + k \cdot b_n) = \frac{m}{b_m} \frac{n}{b_n}(k \cdot b_m + k \cdot b_n)$）。
         *(注：为便于对比，均排除 L1/L2 缓存的影响。实际情况下 Global Load 会先穿透 L1/L2，全部 Miss 后才会读取 Device Memory。)*
 
 ---
@@ -137,8 +138,8 @@ $$\text{占用率} = \frac{\text{SM 中活跃的 Warp 数}}{\text{理论最大 W
         *   后 16 个线程（Thread 16~31）的 `ty = 1`，`tx = 0..15`，访问 Shared Memory 第 1 行。
         也就是说，单个 Warp 跨越了 Shared Memory 的两行。而二维共享内存声明为 `__shared__ float s_input[22][22]`（`SHARED_SIZE = 22`），属于行优先连续排布。
         当 Warp 内部线程同时执行 `s_input[shared_y][shared_x]`，假设此时滑窗迭代到 `ky=0, kx=0`：
-        *   Thread 0 (`ty=0, tx=0`) 访问：$0 \times 22 + 0 = 0 \rightarrow$ **Bank 0**
-        *   Thread 26 (`ty=1, tx=10`) 访问：$1 \times 22 + 10 = 32 \rightarrow$ **Bank 0**
+        *   Thread 0 (`ty=0, tx=0`) 访问： 22 + 0 = 0  **Bank 0**
+        *   Thread 26 (`ty=1, tx=10`) 访问： 22 + 10 = 32  **Bank 0**
         同一 Warp 中的 Thread 0 和 Thread 26 在同一时刻撞击了同一个 Bank 0。同理，Thread 1 和 Thread 27 撞在 Bank 1。导致访问被串行化。
     *   *block(16, 16) Bank conflict计算*：
         *   Block 数：$\text{grid.x} \times \text{grid.y} \times \text{grid.z} = \text{ceil}(3834/16) \times \text{ceil}(2154/16) \times 1 = 32400$
@@ -248,7 +249,7 @@ $$\text{占用率} = \frac{\text{SM 中活跃的 Warp 数}}{\text{理论最大 W
 
 ## 4. 参考文献
 
-1. David B. Kirk, Wen-mei W. Hwu. 《CUDA C 权威编程指南》.
+1. CUDA C编程 权威指南》.
 2. NVIDIA 技术社区. *CUDA 矩阵乘法及卷积算子调优实践深度剖析*.
 3. Tongkaio. *SGEMM & Conv2d Optimization Kernel Samples*, GitHub.
 4. van Werkhoven, B. *An Analysis of Vectorization and Thread Tiling in GPU Kernels*, 2011.
