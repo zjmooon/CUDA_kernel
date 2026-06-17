@@ -4,7 +4,7 @@
 
 本文主要记录并分析 CUDA 2D 直接卷积（Direct Convolution）从最原始的 Naive 实现，到逐步引入共享内存（Shared Memory）、线程粗化、向量化访存以及线程块阻塞（Thread Blocked）等加速技术，避免重复访问全局内存（Global Memory）以提升内存访问效率的完整演进过程。
 
-以4K图像作为输入，3840 * 2160，输入通道1或3，输出通道1，卷积核尺寸为7 * 7，stride，padding默认为1和0.(GTX4080S)
+以4K图像作为输入，3840 * 2160，输入通道1或3，输出通道1，卷积核尺寸为7 * 7，stride，padding默认为1和0.
 ![alt text](convolution2d_elapse_c1.png) 
 ![alt text](convolution2d_elapse_c3.png)
 ---
@@ -33,7 +33,7 @@
 3.  **Latency-Bound（延迟受限区）**：特征是距离 Roofline 边界线较远。由于内存访问延迟或指令执行延迟过高，导致硬件处于饥饿等待状态。
 
 ### 1.3 延迟与隐藏机制
-*   **访存延迟**：
+*   **内存访问延迟**：
   
     | 存储类型     | 延迟(clock cycle) |
     |--------    |--------|
@@ -45,11 +45,13 @@
 *   **指令执行延迟**：相邻指令间存在数据依赖，导致流水线阻塞。
     *   *优化手段*：数据预取。
 *   **时延隐藏 (Latency Hiding)**：时延指 Warp 准备好执行下一条指令所需的时钟周期数。若所有 Warp 调度器在时延期间的每个时钟周期上都有可发射的指令，GPU 就能实现完全利用（时延被成功隐藏），系统利用率达到最大。
-    *   隐藏长度为 $L$ 个时钟周期的时延所需的指令吞吐量取决于硬件架构。对于**计算能力 8.x (Ampere 架构)** 的设备，该值为 $4L$（因为 SM 在一个时钟周期内为 4 个 Warp 各发出一条指令）。
+    *   隐藏长度为 $L$ 个时钟周期的时延所需的指令吞吐量取决于硬件架构。对于**计算能力 比较新的架构** 设备，该值为 $4L$。
+    *   并行性：每一个 SM 有4个 warp scheduler，则SM 在一个时钟周期内为 4 个 Warp 各发出一条指令(128 thread 并行；)。
+    *   并发性：通过warp scheduler 调度，每一个 SM 支持 1536/2048 个线程常驻。
 
 ### 1.4 占用率 (Occupancy)
-$$\text{占用率} = \frac{\text{SM 中活跃的 Warp 数}}{\text{理论最大 Warp 数}}$$
-*   **作用**：更高的占用率通常能带来更好的性能，有助于隐藏内存访问延迟。每个 SM 最多可处理 $1536 / 32 = 48$ 个 Warp。
+$$\text{占用率} = \frac{\text{SM 中活跃的 Warp 数}}{\text{SM 理论最大 Warp 数}}$$
+*   **作用**：更高的占用率通常能带来更好的性能，有助于隐藏内存访问延迟。每个 SM 最多可处理 $1536 / 32 = 48$ 个 Warp (or $2048 / 32 = 64$)。
 *   **限制因素**：每个 Thread Block 中消耗的 Shared Memory 过多，或每个线程占用的寄存器（Register）过多。
     *   *调优建议*：可使用 nvcc 编译标志 `--maxregcount` 强制限制寄存器数量，或使用 `-Xptxas=-v` 获取具体的寄存器和共享内存使用情况。每个 Block 中的线程数量不宜过低（至少 128）。
 *   **API 辅助**：可使用 `cudaOccupancyMaxPotentialBlockSize` 动态计算最佳 BlockSize，使 GPU 占用率达到理论最大化。
@@ -63,17 +65,16 @@ $$\text{占用率} = \frac{\text{SM 中活跃的 Warp 数}}{\text{理论最大 W
 *   **瓶颈分析**：
     *   **Roofline 表现**：处于拐点左侧，且距离边界较远。结合 NCU 分析，优化优先级应以解决 **Latency-Bound** 为主。
     *   **长延迟等待**：全局内存访问延迟大。NCU 中 **Long Scoreboard** 的 Stall Warp 占比高达 **58.74%**，说明 Warp 严重卡在等待长延迟操作上（运算强度几乎为 1）。![alt text](convolution2d_naive_Long_Scoreboard.png)
-    *   **未对齐/非合并访存**：查看 NCU 的 `Memory Workload Analysis -> L1/TEX Cache -> Global Load / Global Store`。发生合并访存时，最小访存单位应等于 `Sectors/Req`。在本内核中，`Sectors/Req` 达到了 **5.71 和 5.79**，均远大于 `float` 类型所需的最小单位 4 bytes。由于输出宽度不满足 32 字节对齐（`OW % 32 != 0`），导致访存未对齐，多消耗了带宽。NCU 的 Source 栏目也给出了 *"global accesses are excessive"* 的警告。![alt text](convolution2d_naive_Sectors_Req.png)![alt text](convolution2d_naive_global_accesses_excessive_2.png)
+    *   **未对齐/非合并访存**：查看 NCU 的 `Memory Workload Analysis -> L1/TEX Cache -> Global Load / Global Store`。发生合并访存时，最小访存单位应等于 `Sectors/Req`。在本内核中，`Sectors/Req` 达到了 **5.71 和 5.79**，均大于 `float` 类型所需的最小单位 4 bytes。由于输出宽度不满足 32 字节对齐（`OW % 32 != 0`），导致访存未对齐，多消耗了带宽。NCU 的 Source 栏目也给出了 *"global accesses are excessive"* 的警告。![alt text](convolution2d_naive_Sectors_Req.png)![alt text](convolution2d_naive_global_accesses_excessive_2.png)
 *   **潜在优化方向**：
     *   向量化（Vectorization）：减少指令数，提高计算访存比。
     *   双缓冲（Double Buffering）：提前加载全局内存，缩短 Long Scoreboard 导致的 Stall 时间。
     *   共享内存（Shared Memory）：Naive 版本对全局内存有严重的重复加载。搬运到 Shared Memory 中可大幅减少无效的延迟。
     *   *数据空间缩减理论*：
-
-         $$\text{Naive 访存量} = OH \times OW \times C_{\text{out}} \times C_{\text{in}} \times KH \times KW$$
-        
-         $$\text{Shared 理论访存量} = \text{grid.x} \times \text{grid.y} \times \text{grid.z}(C_{\text{out}}) \times C_{\text{in}} \times \text{SHAREDSIZE} \times \text{SHAREDSIZE}$$
+        $$\text{Naive 访存量} = H \times W \times C_{\text{out}} \times C_{\text{in}} \times KH \times KW$$
+        $$\text{Shared 理论访存量} = \text{grid.x} \times \text{grid.y} \times \text{grid.z}(C_{\text{out}}) \times C_{\text{in}} \times \text{SHARED\_SIZE} \times \text{SHARED\_SIZE}$$
         在 $3840 \times 2160$ 分辨率下，两者存在 **GB 与 MB** 数量级的巨大差距（类似于 SGEMM 将访存从 $mn(k+k)$ 优化至 $MN(k \cdot b_m + k \cdot b_n) = \frac{m}{b_m} \frac{n}{b_n}(k \cdot b_m + k \cdot b_n)$）。
+        
         *(注：为便于对比，均排除 L1/L2 缓存的影响。实际情况下 Global Load 会先穿透 L1/L2，全部 Miss 后才会读取 Device Memory。)*
 
 ---
@@ -138,8 +139,8 @@ $$\text{占用率} = \frac{\text{SM 中活跃的 Warp 数}}{\text{理论最大 W
         *   后 16 个线程（Thread 16~31）的 `ty = 1`，`tx = 0..15`，访问 Shared Memory 第 1 行。
         也就是说，单个 Warp 跨越了 Shared Memory 的两行。而二维共享内存声明为 `__shared__ float s_input[22][22]`（`SHARED_SIZE = 22`），属于行优先连续排布。
         当 Warp 内部线程同时执行 `s_input[shared_y][shared_x]`，假设此时滑窗迭代到 `ky=0, kx=0`：
-        *   Thread 0 (`ty=0, tx=0`) 访问： 22 + 0 = 0  **Bank 0**
-        *   Thread 26 (`ty=1, tx=10`) 访问： 22 + 10 = 32  **Bank 0**
+        *   Thread 0 (`ty=0, tx=0`) 访问：$0 \times 22 + 0 = 0 \rightarrow$ **Bank 0**
+        *   Thread 26 (`ty=1, tx=10`) 访问：$1 \times 22 + 10 = 32 \rightarrow$ **Bank 0**
         同一 Warp 中的 Thread 0 和 Thread 26 在同一时刻撞击了同一个 Bank 0。同理，Thread 1 和 Thread 27 撞在 Bank 1。导致访问被串行化。
     *   *block(16, 16) Bank conflict计算*：
         *   Block 数：$\text{grid.x} \times \text{grid.y} \times \text{grid.z} = \text{ceil}(3834/16) \times \text{ceil}(2154/16) \times 1 = 32400$
@@ -172,7 +173,7 @@ $$\text{占用率} = \frac{\text{SM 中活跃的 Warp 数}}{\text{理论最大 W
 
 ### 2.4 kConv2dDirect_1x8_Tiling_prefetch（双缓冲预取尝试）
 *   **设计初衷**：旨在通过寄存器进行双缓冲（Double Buffering）数据预取，试图在每次循环迭代中隐式加载下一轮所需的数据，以此解决上一个版本由于 Shared Memory 过大导致占用率降低、无法隐藏内存延迟的问题。
-*   **实际反馈**：实际测试中性能反而有所降低，后续需借助 NCU 进一步深入分析其编译器生成的汇编指令依赖（可能由于寄存器压力过大触发了 Spill 到 Local Memory 导致）。
+*   **实际反馈**：实际测试中性能反而有所降低，后续需借助 NCU 进一步深入分析其编译器生成的汇编指令依赖（可能由于寄存器压力过大触发了 Spill 到 Local Memory 导致。（以上是幻觉推理，实际原因只能由nsys慢慢排查...））。
 
 ---
 
@@ -247,9 +248,9 @@ $$\text{占用率} = \frac{\text{SM 中活跃的 Warp 数}}{\text{理论最大 W
 
 ---
 
-## 4. 参考文献
+## 4. Ref
 
-1. CUDA C编程 权威指南》.
+1. David B. Kirk, Wen-mei W. Hwu. 《CUDA C 权威编程指南》.
 2. NVIDIA 技术社区. *CUDA 矩阵乘法及卷积算子调优实践深度剖析*.
 3. Tongkaio. *SGEMM & Conv2d Optimization Kernel Samples*, GitHub.
 4. van Werkhoven, B. *An Analysis of Vectorization and Thread Tiling in GPU Kernels*, 2011.
