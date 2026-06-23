@@ -143,8 +143,8 @@ $$\text{占用率} = \frac{\text{SM 中活跃的 Warp 数}}{\text{SM 理论最�
         * 后 16 个线程（Thread 16~31）的 `ty = 1`，`tx = 0..15`，访问 Shared Memory 第 1 行。
         也就是说，单个 Warp 跨越了 Shared Memory 的两行。而二维共享内存声明为 `__shared__ float s_input[22][22]`（`SHARED_SIZE = 22`），属于行优先连续排布。
         当 Warp 内部线程同时执行 `s_input[shared_y][shared_x]`，假设此时滑窗迭代到 `ky=0, kx=0`：
-        * Thread 0 (`ty=0, tx=0`) 访问：$0 × 22 + 0 = 0$ ->  **Bank 0**
-        * Thread 26 (`ty=1, tx=10`) 访问：$1 × 22 + 10 = 32$ ->  **Bank 0**
+        * Thread 0 (`ty=0, tx=0`) 访问：0 × 22 + 0 = 0 ->  **Bank 0**
+        * Thread 26 (`ty=1, tx=10`) 访问：1 × 22 + 10 = 32 ->  **Bank 0**
   
         同一 Warp 中的 Thread 0 和 Thread 26 在同一时刻撞击了同一个 Bank 0。同理，Thread 1 和 Thread 27 撞在 Bank 1。导致访问被串行化。
     * *block(16, 16) Bank conflict计算*：
