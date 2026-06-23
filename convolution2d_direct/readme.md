@@ -75,7 +75,7 @@ $$\text{占用率} = \frac{\text{SM 中活跃的 Warp 数}}{\text{SM 理论最�
     *   *数据空间缩减理论*：
         $$\text{Naive 访存量} = H \times W \times C_{\text{out}} \times C_{\text{in}} \times KH \times KW$$
 
-        $$\text{Shared 理论访存量} = \text{grid.x} \times \text{grid.y} \times \text{grid.z}(C_{\text{out}}) \times C_{\text{in}} \times \text{SHARED\_SIZE} \times \text{SHARED\_SIZE}$$
+        $$ Shared 访存量 = grid.x × grid.y × grid.z(Cout) × Cin × sharedSize × sharedSize$$
         
         在 $3840 \times 2160$ 分辨率下，两者存在 **GB 与 MB** 数量级的巨大差距（类似于 SGEMM 将访存从 $mn(k+k)$ 优化至 $MN(k \cdot b_m + k \cdot b_n) = \frac{m}{b_m} \frac{n}{b_n}(k \cdot b_m + k \cdot b_n)$）。
         
@@ -138,20 +138,21 @@ $$\text{占用率} = \frac{\text{SM 中活跃的 Warp 数}}{\text{SM 理论最�
     使用了 Shared Memory 但性能未暴涨，很自然指向了 Bank Conflict。
     
     NCU 证实：`shared load` 存在**两路冲突**，`shared store` 也有 1 点多的 conflict。![alt text](convolution2d_shared_bank_conflict.png)
-    * *冲突根源*：当前线程块布局为 `block(16, 16)`。一个 Warp 包含 32 个线程：
+    * *Conflict分析*：当前线程块布局为 `block(16, 16)`。一个 Warp 包含 32 个线程：
         * 前 16 个线程（Thread 0~15）的 `ty = 0`，`tx = 0..15`，访问 Shared Memory 第 0 行。
         * 后 16 个线程（Thread 16~31）的 `ty = 1`，`tx = 0..15`，访问 Shared Memory 第 1 行。
         也就是说，单个 Warp 跨越了 Shared Memory 的两行。而二维共享内存声明为 `__shared__ float s_input[22][22]`（`SHARED_SIZE = 22`），属于行优先连续排布。
         当 Warp 内部线程同时执行 `s_input[shared_y][shared_x]`，假设此时滑窗迭代到 `ky=0, kx=0`：
-        * Thread 0 (`ty=0, tx=0`) 访问：$0 \times 22 + 0 = 0 \rightarrow$ **Bank 0**
-        * Thread 26 (`ty=1, tx=10`) 访问：$1 \times 22 + 10 = 32 \rightarrow$ **Bank 0**
+        * Thread 0 (`ty=0, tx=0`) 访问：$0 × 22 + 0 = 0 \rightarrow$ **Bank 0**
+        * Thread 26 (`ty=1, tx=10`) 访问：$1 × 22 + 10 = 32 \rightarrow$ **Bank 0**
+  
         同一 Warp 中的 Thread 0 和 Thread 26 在同一时刻撞击了同一个 Bank 0。同理，Thread 1 和 Thread 27 撞在 Bank 1。导致访问被串行化。
     * *block(16, 16) Bank conflict计算*：
-        * Block 数：$\text{grid.x} \times \text{grid.y} \times \text{grid.z} = \text{ceil}(3834/16) \times \text{ceil}(2154/16) \times 1 = 32400$
-        * Warp/Block 数：$\frac{\text{block.x} \times \text{block.y}}{32} = 8$
-        * 总 Warp 数：$32400 \times 8 = 259200$
-        * 每 Warp 内部执行 `shared load` 次数：$C_{\text{in}} \times \text{KERNEL\_SIZE} \times \text{KERNEL\_SIZE} = 3 \times 7 \times 7 = 147$
-        * 总的 `shared load` 指令请求数：$259200 \times 147 = 38102400$。在存在 2 路冲突时，耗时指令周期直接翻倍。
+        * $Block 数：grid.x × grid.y × grid.z = ceil(3834/16) × ceil(2154/16) × 1 = 32400$
+        * $Warp/Block 数：block.x × block.y / 32 = 8$
+        * $总 Warp 数：32400 × 8 = 259200$
+        * $每 Warp 内部执行 'shared load' 次数：C_in × KERNEL\_SIZE × KERNEL\_SIZE = 3 × 7 × 7 = 147$
+        * $总的 `shared load` 指令请求数：259200 × 147 = 38102400。在存在 2 路冲突时，耗时指令周期直接翻倍。$
     *   *解决方案*：将 Block 布局从 `block(16, 16)` 调整为 `block(32, 8)`，并对应修改 `TILE_SHARED`，迫使单个 Warp 紧凑排布在同一行内。
     ```CPP
     #define BLOCK_SIZE_X 32
@@ -169,8 +170,8 @@ $$\text{占用率} = \frac{\text{SM 中活跃的 Warp 数}}{\text{SM 理论最�
 ```
 *   **优化原理**：通过线程粗化（Thread Coarsening）提高单个线程的计算复用率。减少了多余的地址计算指令（如 `IMAD`）、谓词设置指令（如 `ISETP`）以及内存访问延迟。![alt text](convolution2d_8Tile_instructions.png)
 *   **权衡代价**：增大了单个 Block 的 Shared Memory 容量消耗，这会限制 Warp 调度器的弹性，降低占用率（Occupancy），从而削弱了隐藏内存延迟的能力。因此需要谨慎权衡占用率与 Shared Memory 大小（在实际开发中需对比 1x2、* **光晕（Halo）边沿压缩比优势**：二维直接卷积与 SGEMM 不同，在 Global $\rightarrow$ Shared 搬运时，必须额外多加载一圈由卷积核半径决定的 Halo 边界元素。随着 Tiling 尺寸扩大，这部分多余加载的浪费比例被有效稀释：
-    * **基础 Shared 版本**：有效计算像素 $32 \times 8 = 256$。Shared Memory 实际读取数为 $(32 + 6) \times (8 + 6) = 532$。访存/计算比率：$532 / 256 = 2.078$。
-    * **1x8 Tiling 版本**：有效计算像素 $(32 \times 8) \times 8 = 2048$。Shared Memory 实际读取数为 $(256 + 6) \times (8 + 6) = 3668$。访存/计算比率：$3668 / 2048 = 1.791$（浪费明显下降）。
+    * **基础 Shared 版本**：有效计算像素 $32 × 8 = 256$。Shared Memory 实际读取数为 $(32 + 6) × (8 + 6) = 532$。访存/计算比率：$532 / 256 = 2.078$。
+    * **1x8 Tiling 版本**：有效计算像素 $(32 × 8) × 8 = 2048$。Shared Memory 实际读取数为 $(256 + 6) × (8 + 6) = 3668$。访存/计算比率：$3668 / 2048 = 1.791$（浪费明显下降）。
 
 ---
 
