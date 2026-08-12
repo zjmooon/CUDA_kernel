@@ -112,6 +112,7 @@ __global__ void kConv2dDirect_naive(
 
     output[out_c * OH * OW + out_y * OW + out_x] = sum;
 }
+// 利用 grid, block的最大支持的6个并行维度，将可并行的维度并行化（后续利用内置变量获取其索引）
 void iConv2dDirect_naive(
     const float* __restrict__ input,   // [Cin][H][W]
     /* const float* __restrict__ kernel, */  // [Cout][Cin][KH][KW]
@@ -811,7 +812,7 @@ __global__ void kConv2dThread_blocked(
     int stride, int pad
 ) 
 {
-    __shared__ float s_input[S_H][S_W];
+    __shared__ float s_input[S_H][S_W];  //[38][134]
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
@@ -827,14 +828,14 @@ __global__ void kConv2dThread_blocked(
     float acc[TM][TN] = {0.0f};
 
     const int tid = ty * blockDim.x + tx;
-    const int num_threads = blockDim.x * blockDim.y;
+    const int threads_stride = blockDim.x * blockDim.y;
     
     float* reg_kernel = d_kernel_const;
 
     for (int c = 0; c < Cin; c++) {
         // global -> shared memory
         #pragma unroll
-        for (int i = tid; i < S_H * S_W; i += num_threads) {
+        for (int i = tid; i < S_H * S_W; i += threads_stride) {
             int s_y = i / S_W;
             int s_x = i % S_W;
             int in_y = in_start_y + s_y;
@@ -862,6 +863,7 @@ __global__ void kConv2dThread_blocked(
                         int shared_y = out_y_local * STRIDE + ky;
                         int shared_x = out_x_local * STRIDE + kx;
 
+                        // 4 bank conflict
                         acc[m][n] += s_input[shared_y][shared_x] * reg_kernel[k_idx];
                     }
                 }
@@ -907,6 +909,272 @@ void iConv2dThread_blocked(
 
     // <int BM, int BN, int TM, int TN, int KH, int KW, int S_H, int S_W>
     kConv2dThread_blocked<32, 128, 4, 4, KERNEL_SIZE, KERNEL_SIZE, 38, 134><<<grid, block>>>(
+        input, output,
+        Cin, H, W,
+        Cout, OH, OW,
+        stride, pad
+    );
+}
+
+
+template<int BM, int BN, int TM, int TN, int KH, int KW, int S_H, int S_W>
+__global__ void kConv2dThread_blocked_swizzle(
+    const float* __restrict__ input,   // [Cin][H][W]
+    float* __restrict__ output,        // [Cout][OH][OW]
+    int Cin, int H, int W,
+    int Cout, int OH, int OW,
+    int stride, int pad
+) 
+{
+    __shared__ float s_input[S_H][136];  //[38][134] -> [38][136]
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int bx = blockIdx.x; 
+    const int by = blockIdx.y; 
+    const int out_c = blockIdx.z; 
+
+    const int out_start_y = by * BM;
+    const int out_start_x = bx * BN;
+    const int in_start_y = out_start_y * STRIDE - pad;
+    const int in_start_x = out_start_x * STRIDE - pad;
+
+    float acc[TM][TN] = {0.0f};
+
+    const int tid = ty * blockDim.x + tx;
+    const int threads_stride = blockDim.x * blockDim.y;
+    
+    float* reg_kernel = d_kernel_const;
+
+    for (int c = 0; c < Cin; c++) {
+        // global -> shared memory
+        #pragma unroll
+        for (int i = tid; i < S_H * S_W; i += threads_stride) {
+            int s_y = i / S_W;
+            int s_x = i % S_W;
+            int in_y = in_start_y + s_y;
+            int in_x = in_start_x + s_x;
+            
+            float value = (in_x >= 0 && in_x < W && in_y >= 0 && in_y < H) ? 
+                input[c * H * W + in_y * W + in_x] : 0.0f; // 越界补0
+
+            // swizzle logical_x -> physical_x TN==4
+            int swi_y = s_x % 4;
+            int swi_x = s_x / 4;
+
+            int physical_x = swi_y * 34 + swi_x;
+            s_input[s_y][physical_x] = value;
+        }
+        __syncthreads();
+
+        // convolution compute
+        #pragma unroll
+        for (int ky = 0; ky < KH; ++ky) {
+            #pragma unroll
+            for (int kx = 0; kx < KW; ++kx) {
+                int k_idx = out_c * Cin * KH * KW + c * KH * KW + ky * KW + kx;
+    
+                #pragma unroll
+                for (int m = 0; m < TM; ++m) {
+                    #pragma unroll
+                    for (int n = 0; n < TN; ++n) {
+                        int out_y_local = ty * TM + m;
+                        int out_x_local = tx * TN + n;
+
+                        int shared_y = out_y_local * STRIDE + ky;
+                        int shared_x = out_x_local * STRIDE + kx;
+
+                        // swizzle logical_x -> physical_x
+                        int swi_y = shared_x % 4;
+                        int swi_x = shared_x / 4;
+                        int physical_x = swi_y * 34 + swi_x;
+
+                        acc[m][n] += s_input[shared_y][physical_x] * reg_kernel[k_idx];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // write back
+    #pragma unroll
+    for (int m = 0; m < TM; ++m) {
+        #pragma unroll
+        for (int n = 0; n < TN; ++n) {
+            int global_out_y = out_start_y + ty * TM + m;
+            int global_out_x = out_start_x + tx * TN + n;
+
+            if (global_out_y < OH && global_out_x < OW) {
+                output[out_c * OH * OW + global_out_y * OW + global_out_x] = acc[m][n];
+            }
+        }
+    }
+}
+void iConv2dThread_blocked_swizzle(
+    const float* __restrict__ input,   
+    float* __restrict__ output,        
+    int Cin, int H, int W,
+    int Cout, int KH, int KW,
+    int OH, int OW,
+    int stride, int pad ) 
+{
+    const int TM = 4; 
+    const int TN = 4; 
+    
+    dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y); 
+    
+    const int BM = block.y * TM; // 8 * 4 = 32
+    const int BN = block.x * TN; // 32 * 4 = 128
+
+    dim3 grid(CEIL(OW, BN), CEIL(OH, BM), Cout);
+
+    const int S_H = (BM - 1) * stride + KH; // 32 + 7 - 1 = 38
+    const int S_W = (BN - 1) * stride + KW; // 128 + 7 - 1 = 134
+
+    // <int BM, int BN, int TM, int TN, int KH, int KW, int S_H, int S_W>
+    kConv2dThread_blocked_swizzle<32, 128, 4, 4, KERNEL_SIZE, KERNEL_SIZE, 38, 134><<<grid, block>>>(
+        input, output,
+        Cin, H, W,
+        Cout, OH, OW,
+        stride, pad
+    );
+}
+
+
+template<int BM, int BN, int TM, int TN, int KH, int KW, int S_H, int S_W>
+__global__ void kConv2dThread_blocked_float4(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int Cin, int H, int W,
+    int Cout, int OH, int OW,
+    int stride, int pad
+)
+{
+    __shared__ float s_input[S_H][S_W];
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+    const int out_c = blockIdx.z;
+
+    const int out_start_y = by * BM;
+    const int out_start_x = bx * BN;
+
+    const int in_start_y = out_start_y * stride - pad;
+    const int in_start_x = out_start_x * stride - pad;
+
+    float acc[TM][TN] = {0.0f};
+
+    const int tid = ty * blockDim.x + tx;
+    const int threads_stride = blockDim.x * blockDim.y;
+
+    const float* reg_kernel = d_kernel_const;
+
+    for(int c = 0; c < Cin; c++) {
+        // global -> shared
+        // float4 vector load
+        const int total = S_H * S_W;
+
+        for(int i = tid * 4; i < total; i+=threads_stride * 4) {
+            const int s_y = i / S_W;
+            const int s_x = i % S_W;
+
+            /* #pragma unroll
+            if(s_x + 3 < S_W) { */
+                const int in_y = in_start_y + s_y;
+                const int in_x = in_start_x + s_x;
+        
+                reinterpret_cast<float4*>(&s_input[s_y][s_x])[0] = (in_y >= 0 && in_y < H && in_x >= 0 && in_x + 3 < W) ? 
+                    reinterpret_cast<const float4*>(&input[c * H * W + in_y * W + in_x])[0] : 
+                    make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            /* } else {
+                // tail 
+                #pragma unroll
+                for (int k = s_x; k < S_W; k++) {
+                    int in_y =  in_start_y + s_y;
+                    int in_x = in_start_x + k;
+
+                    s_input[s_y][k] = ( in_y >= 0 && in_y < H && in_x >= 0 && in_x < W) ? input[c * H * W + in_y * W + in_x] : 0.0f;
+                }
+            } */
+        }
+        __syncthreads();
+
+
+        // convolution compute
+        #pragma unroll
+        for(int ky = 0; ky < KH; ky++) {
+            #pragma unroll
+            for(int kx = 0; kx < KW; kx++)
+            {
+                int k_idx = out_c * Cin * KH * KW + c * KH * KW + ky * KW + kx;
+                float weight = reg_kernel[k_idx];
+
+                #pragma unroll
+                for(int m = 0; m < TM; m++)
+                {
+                    #pragma unroll
+                    for(int n = 0; n < TN; n++)
+                    {
+                        int out_y_local = ty * TM + m;
+                        int out_x_local = tx * TN + n;
+
+                        int shared_y = out_y_local * stride + ky;
+                        int shared_x = out_x_local * stride + kx;
+
+                        acc[m][n] += s_input[shared_y][shared_x] * weight;
+                    }
+                }
+            }
+        }
+
+        __syncthreads();
+
+    }
+        
+    // write back
+    #pragma unroll
+    for(int m = 0; m < TM; m++) {
+        #pragma unroll
+        for(int n = 0; n < TN; n++)
+        {
+            int y = out_start_y + ty * TM + m;
+            int x = out_start_x + tx * TN + n;
+
+            if (y < OH && x < OW)
+            {
+                output[out_c * OH * OW + y * OW+ x] = acc[m][n];
+
+            }
+        }
+    }
+}
+// 性能暴跌原因： 高Stall MIO Throttle -> 低IPC
+void iConv2dThread_blocked_float4(
+    const float* __restrict__ input,   
+    float* __restrict__ output,        
+    int Cin, int H, int W,
+    int Cout, int KH, int KW,
+    int OH, int OW,
+    int stride, int pad ) 
+{
+    const int TM = 4; 
+    const int TN = 4; 
+    
+    dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y);
+    
+    const int BM = BLOCK_SIZE_Y * TM; // 8 * 4 = 32
+    const int BN = BLOCK_SIZE_X * TN; // 32 * 4 = 128
+
+    dim3 grid(CEIL(OW, BN), CEIL(OH, BM), Cout);
+
+    // const int S_H = (BM - 1) * stride + KH; // 32 + 7 - 1 = 38
+    // const int S_W = (BN - 1) * stride + KW; // 128 + 7 - 1 = 134
+    // const int S_W = ((BN - 1) * stride + KW + 3) / 4 * 4; // (128 + 7 - 1 + 3) / 4 * 4 = 136, 向上对齐到4的倍数
+
+    // <int BM, int BN, int TM, int TN, int KH, int KW, int S_H, int S_W>
+    kConv2dThread_blocked_float4<32, 128, 4, 4, KERNEL_SIZE, KERNEL_SIZE, 38, 136><<<grid, block>>>(
         input, output,
         Cin, H, W,
         Cout, OH, OW,
@@ -1151,6 +1419,42 @@ int main() {
     }));
     std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
     " [device thread tile]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(float));
+    CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);   
+    
+    // gpu thread (thread tile)
+    CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(float)));
+    total_time = TIME_RECORD(repeat_times, ([&]{
+        iConv2dThread_blocked_swizzle(
+            d_input,
+            d_output,
+            INPUT_CHANNELS, H, W,
+            OUTPUT_CHANNELS, KH, KW,
+            OH, OW,
+            stride, pad
+        );
+    }));
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
+    " [device thread tile swizzle]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
+    memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(float));
+    CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
+    verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);   
+
+    // gpu thread float4 (thread tile)
+    CHECK(cudaMemset(d_output, 0, OUTPUT_CHANNELS * OH * OW * sizeof(float)));
+    total_time = TIME_RECORD(repeat_times, ([&]{
+        iConv2dThread_blocked_float4(
+            d_input,
+            d_output,
+            INPUT_CHANNELS, H, W,
+            OUTPUT_CHANNELS, KH, KW,
+            OH, OW,
+            stride, pad
+        );
+    }));
+    std::cout << GREEN << std::endl  << __FILE__ << ":" << __LINE__ << 
+    " [device thread tile float4]: elapsed = " << total_time / repeat_times << " ms " << RESET << std::endl;
     memset(h_output_ref.data(), 0, OUTPUT_CHANNELS * OH * OW * sizeof(float));
     CHECK(cudaMemcpy(h_output_ref.data(), d_output, OUTPUT_CHANNELS * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
     verifyResult(h_output.data(), h_output_ref.data(), OUTPUT_CHANNELS * OH * OW);   
