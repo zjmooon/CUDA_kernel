@@ -926,6 +926,7 @@ __global__ void kConv2dThread_blocked_swizzle(
     int stride, int pad
 ) 
 {
+    // 4 * 34 = 136
     __shared__ float s_input[S_H][136];  //[38][134] -> [38][136]
 
     const int tx = threadIdx.x;
@@ -962,6 +963,7 @@ __global__ void kConv2dThread_blocked_swizzle(
             int swi_y = s_x % 4;
             int swi_x = s_x / 4;
 
+            // ceil(134, 4) = 34
             int physical_x = swi_y * 34 + swi_x;
             s_input[s_y][physical_x] = value;
         }
